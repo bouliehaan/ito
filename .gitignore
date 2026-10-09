@@ -1,0 +1,28 @@
+# Gradle
+.gradle/
+build/
+.kotlin/
+!android/gradle/wrapper/gradle-wrapper.jar
+local.properties
+
+# Android signing — the release key is generated on first build and must never leave this machine
+android/keystore/
+*.jks
+*.keystore
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Magisk module output
+android/magisk/out/
+
+# Swift
+mac/.build/
+mac/.swiftpm/
+mac/build/
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store

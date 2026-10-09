@@ -1,0 +1,239 @@
+package app.ito
+
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.telecom.Call
+import android.telecom.InCallService
+import android.telecom.TelecomManager
+import android.telecom.VideoProfile
+import android.telephony.PhoneStateListener
+import android.telephony.TelephonyManager
+import android.util.Log
+import app.ito.link.PhoneLink
+import org.json.JSONObject
+import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Bound by Telecom for every call, with no UI of its own (the phone's dialer
+ * stays the dialer). Only happens when ito holds CONTROL_INCALL_EXPERIENCE,
+ * i.e. the system install.
+ */
+class CallMonitor : InCallService() {
+    private val calls get() = (application as ItoApp).bridge.calls
+
+    override fun onCallAdded(call: Call) = calls.onAdded(this, call)
+    override fun onCallRemoved(call: Call) = calls.onRemoved(call)
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        calls.onUnbound(this)
+        return super.onUnbind(intent)
+    }
+}
+
+/**
+ * Every call the phone has, as the Mac sees it, and the Mac's hands on them.
+ *
+ * Two levels:
+ *  - system install: full control through CallMonitor, and audio over the
+ *    link through [CallAudio].
+ *  - plain install: the legacy phone-state broadcast shows ringing / in call /
+ *    idle on the Mac and lets it decline. Audio stays on the phone.
+ */
+class Calls(private val bridge: Bridge) {
+    private val ids = WeakHashMap<Call, String>()
+    private val calls = ConcurrentHashMap<String, Call>()
+    private val nextId = AtomicInteger(1)
+    @Volatile private var service: InCallService? = null
+
+    val audio = CallAudio(bridge.ctx)
+    @Volatile private var audioOwner: PhoneLink.Session? = null
+    @Volatile private var audioCall: String? = null
+    /** Calls a Mac answered or dialed: audio follows them there as soon as they go active. */
+    private val wantsAudio = ConcurrentHashMap<String, PhoneLink.Session>()
+    @Volatile private var pendingDial: PhoneLink.Session? = null
+
+    private val telecom get() = bridge.ctx.getSystemService(TelecomManager::class.java)
+
+    val fullControl: Boolean
+        get() = bridge.ctx.checkSelfPermission("android.permission.CONTROL_INCALL_EXPERIENCE") == PackageManager.PERMISSION_GRANTED
+
+    // --- Telecom side ----------------------------------------------------------
+
+    fun onAdded(svc: InCallService, call: Call) {
+        service = svc
+        val id = "c" + nextId.getAndIncrement()
+        synchronized(ids) { ids[call] = id }
+        calls[id] = call
+        if (call.details.callDirection == Call.Details.DIRECTION_OUTGOING) {
+            pendingDial?.let { wantsAudio[id] = it }
+            pendingDial = null
+        }
+        call.registerCallback(object : Call.Callback() {
+            override fun onStateChanged(c: Call, state: Int) = changed(c)
+            override fun onDetailsChanged(c: Call, details: Call.Details) = changed(c)
+        })
+        changed(call)
+    }
+
+    fun onRemoved(call: Call) {
+        val id = idOf(call) ?: return
+        calls.remove(id)
+        wantsAudio.remove(id)
+        if (audioCall == id) stopAudio()
+        bridge.link.broadcast(stateJson(id, call).put("state", "ended"))
+    }
+
+    fun onUnbound(svc: InCallService) {
+        if (service === svc) service = null
+    }
+
+    private fun changed(call: Call) {
+        val id = idOf(call) ?: return
+        val state = call.details.state
+        // Outgoing: open the audio while dialing, so the Mac hears the ringback.
+        val outgoing = call.details.callDirection == Call.Details.DIRECTION_OUTGOING
+        if (state == Call.STATE_ACTIVE || (outgoing && state == Call.STATE_DIALING)) wantsAudio.remove(id)?.let { startAudio(id, it) }
+        if (state == Call.STATE_DISCONNECTED && audioCall == id) stopAudio()
+        bridge.link.broadcast(stateJson(id, call))
+    }
+
+    private fun idOf(call: Call) = synchronized(ids) { ids[call] }
+
+    private fun stateJson(id: String, call: Call): JSONObject {
+        val d = call.details
+        val number = d.handle?.schemeSpecificPart ?: ""
+        return JSONObject()
+            .put("t", "call").put("id", id)
+            .put("state", stateName(d.state))
+            .put("n", number)
+            .put("nm", d.contactDisplayName ?: bridge.store.nameFor(number) ?: "")
+            .put("dir", if (d.callDirection == Call.Details.DIRECTION_OUTGOING) "out" else "in")
+            .put("since", d.connectTimeMillis)
+            .put("audio", audioCall == id)
+            .put("full", true)
+    }
+
+    /** Sent to a Mac that connects mid-call, so it can show what is going on. */
+    fun snapshot(): List<JSONObject> = calls.entries.map { (id, c) -> stateJson(id, c) }
+
+    // --- Mac side ---------------------------------------------------------------
+
+    fun handle(session: PhoneLink.Session, m: JSONObject) {
+        val id = m.optString("id")
+        val call = calls[id]
+        when (m.getString("t")) {
+            "dial" -> {
+                val n = m.getString("n").filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                require(n.isNotEmpty()) { "no number" }
+                pendingDial = session
+                telecom.placeCall(Uri.fromParts("tel", n, null), Bundle())
+            }
+            "answer" -> {
+                if (call != null) {
+                    wantsAudio[id] = session
+                    call.answer(VideoProfile.STATE_AUDIO_ONLY)
+                } else legacyAnswer()
+            }
+            "decline" -> if (call != null) call.reject(false, null) else legacyEnd()
+            "hangup" -> if (call != null) call.disconnect() else legacyEnd()
+            "dtmf" -> call?.let {
+                val digit = m.getString("d").first()
+                it.playDtmfTone(digit)
+                it.stopDtmfTone()
+            }
+            "hold" -> call?.let { if (m.optBoolean("on")) it.hold() else it.unhold() }
+            "audio" -> if (m.optBoolean("on")) {
+                if (call?.details?.state == Call.STATE_ACTIVE) startAudio(id, session) else wantsAudio[id] = session
+            } else if (audioCall == id) stopAudio()
+        }
+    }
+
+    fun onSessionClosed(session: PhoneLink.Session) {
+        wantsAudio.entries.removeIf { it.value === session }
+        if (audioOwner === session) stopAudio() // the call carries on, on the phone
+    }
+
+    fun onMacAudio(session: PhoneLink.Session, frame: ByteArray) {
+        if (session === audioOwner) audio.onMacFrame(frame)
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+
+    private fun startAudio(id: String, session: PhoneLink.Session, attempt: Int = 0) {
+        if (!calls.containsKey(id)) return
+        if (audioCall != null && audioCall != id) stopAudio()
+        bridge.service?.promoteForCall(true)
+        val err = audio.start { frame -> session.sendAudio(frame) }
+        if (err != null) {
+            // Telecom can report the call before it has switched the audio mode to
+            // "in call", and the redirection API refuses until it has. Give it a moment.
+            if (attempt < 8) {
+                main.postDelayed({ startAudio(id, session, attempt + 1) }, 250)
+                return
+            }
+            Log.w("ito-calls", "call audio failed: $err")
+            bridge.service?.promoteForCall(false)
+            session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", err))
+            return
+        }
+        audioOwner = session
+        audioCall = id
+        calls[id]?.let { bridge.link.broadcast(stateJson(id, it)) }
+    }
+
+    private fun stopAudio() {
+        audio.stop()
+        val id = audioCall
+        audioOwner = null
+        audioCall = null
+        bridge.service?.promoteForCall(false)
+        id?.let { calls[it] }?.let { bridge.link.broadcast(stateJson(id, it)) }
+    }
+
+    // --- plain install fallback ---------------------------------------------------
+
+    @Suppress("DEPRECATION")
+    private val legacy = object : PhoneStateListener() {
+        override fun onCallStateChanged(state: Int, number: String?) {
+            if (fullControl) return
+            val s = when (state) {
+                TelephonyManager.CALL_STATE_RINGING -> "ringing"
+                TelephonyManager.CALL_STATE_OFFHOOK -> "active"
+                else -> "ended"
+            }
+            val n = number ?: ""
+            bridge.link.broadcast(
+                JSONObject().put("t", "call").put("id", "legacy").put("state", s).put("n", n)
+                    .put("nm", if (n.isEmpty()) "" else bridge.store.nameFor(n) ?: "")
+                    .put("dir", "in").put("audio", false).put("full", false),
+            )
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    fun startLegacy() {
+        if (fullControl) return
+        runCatching {
+            bridge.ctx.getSystemService(TelephonyManager::class.java).listen(legacy, PhoneStateListener.LISTEN_CALL_STATE)
+        }
+    }
+
+    @Suppress("DEPRECATION", "MissingPermission")
+    private fun legacyAnswer() = runCatching { telecom.acceptRingingCall() }
+
+    @Suppress("MissingPermission")
+    private fun legacyEnd() = runCatching { telecom.endCall() }
+
+    private fun stateName(s: Int) = when (s) {
+        Call.STATE_RINGING, Call.STATE_SIMULATED_RINGING -> "ringing"
+        Call.STATE_DIALING, Call.STATE_CONNECTING, Call.STATE_NEW, Call.STATE_SELECT_PHONE_ACCOUNT, Call.STATE_PULLING_CALL -> "dialing"
+        Call.STATE_ACTIVE, Call.STATE_AUDIO_PROCESSING -> "active"
+        Call.STATE_HOLDING -> "held"
+        Call.STATE_DISCONNECTING, Call.STATE_DISCONNECTED -> "ended"
+        else -> "dialing"
+    }
+}

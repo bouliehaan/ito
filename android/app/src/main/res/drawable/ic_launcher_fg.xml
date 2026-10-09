@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 糸電話: two cups and the thread between them. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF" android:pathData="M33,46h8v16h-8z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M67,46h8v16h-8z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M41,53.25h26v1.5h-26z" />
+</vector>
