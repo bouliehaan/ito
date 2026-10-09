@@ -26,3 +26,4 @@ mac/build/
 .idea/
 *.iml
 .DS_Store
+android/.build/
