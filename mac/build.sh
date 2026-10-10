@@ -12,8 +12,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CONFIG="${1:-release}"
-swift build -c "$CONFIG" --product ito
-BIN="$(swift build -c "$CONFIG" --product ito --show-bin-path)/ito"
+VERSION="$(cat ../VERSION)"
+BUILD="$(echo "$VERSION" | awk -F. '{ print $1 * 10000 + $2 * 100 + $3 }')"
+# Release builds are universal (Apple silicon + Intel); debug builds are host-only.
+ARCHS=()
+[ "$CONFIG" = release ] && ARCHS=(--arch arm64 --arch x86_64)
+swift build -c "$CONFIG" --product ito ${ARCHS[@]+"${ARCHS[@]}"}
+BIN="$(swift build -c "$CONFIG" --product ito ${ARCHS[@]+"${ARCHS[@]}"} --show-bin-path)/ito"
 
 APP=build/ito.app
 rm -rf "$APP"
@@ -22,7 +27,7 @@ cp "$BIN" "$APP/Contents/MacOS/ito"
 cp Resources/Fonts/*.otf "$APP/Contents/Resources/Fonts/"
 cp Resources/ito.icns "$APP/Contents/Resources/ito.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -33,8 +38,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key><string>ito</string>
     <key>CFBundleIconFile</key><string>ito</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$BUILD</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.social-networking</string>
     <key>NSHighResolutionCapable</key><true/>

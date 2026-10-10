@@ -27,3 +27,4 @@ mac/build/
 *.iml
 .DS_Store
 android/.build/
+dist/

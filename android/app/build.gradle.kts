@@ -8,6 +8,11 @@ plugins {
 // privileged system app through Magisk, and Android only lets a system app be
 // updated by an APK with the SAME signature. tools/keystore.sh makes the key
 // once (gitignored); losing it means reinstalling the Magisk module.
+// One version for the phone and the Mac: /VERSION. The phone's versionCode is derived
+// (1.2.3 -> 10203) so it always goes up with the version, or Android refuses the update.
+val itoVersion = rootProject.file("../VERSION").readText().trim()
+val itoVersionCode = itoVersion.split(".").map(String::toInt).let { (a, b, c) -> a * 10000 + b * 100 + c }
+
 val keystoreProperties =
     rootProject.file("keystore/keystore.properties").takeIf { it.exists() }?.let { f ->
         Properties().apply { f.inputStream().use { load(it) } }
@@ -22,8 +27,8 @@ android {
         // 33: the call-audio redirection API and Conscrypt's X25519 are both there.
         minSdk = 33
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = itoVersionCode
+        versionName = itoVersion
     }
 
     signingConfigs {
