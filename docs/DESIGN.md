@@ -134,9 +134,10 @@ uplink) and the background-start pair that lets the bridge become a microphone
 foreground service from the background.
 
 Audio is 16 kHz mono PCM, 20 ms frames, uncompressed: 256 kbit/s each way, nothing on a
-LAN, and no codec in either app. The Mac side runs Apple's voice processing (echo
-cancellation, noise suppression), which is what stops the caller hearing themselves out
-of your speakers.
+LAN, and no codec in either app. On speakers the Mac side runs Apple's voice processing
+(echo cancellation, noise suppression), which is what stops the caller hearing themselves
+out of your speakers; on Bluetooth headphones it runs the mic and the playback as separate
+engines instead (docs/CALLS.md).
 
 The allowlist the module ships is generated from the APK's manifest, and the module build
 fails on any permission it has not classified, because a privileged app missing an

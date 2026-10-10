@@ -8,23 +8,34 @@ private let log = Logger(subsystem: "app.ito", category: "audio")
 
 /// The Mac's half of a call: microphone out, the other person in.
 ///
-/// Voice processing is Apple's own (the VPIO unit behind FaceTime): echo
-/// cancellation against what the speakers play, noise suppression, AGC. That
-/// matters more than anything else here. Without it, your speakers feed the
-/// caller's voice back into your mic and they hear themselves.
+/// Two shapes, chosen when the call starts:
 ///
-/// Devices move under us. Opening the mic flips Bluetooth headphones from music
-/// mode to call mode, which changes the input format mid-setup and stops the
-/// engine. So: the mic tap always takes whatever format the device delivers
-/// right then, every AVAudioEngine call that can raise an Objective-C exception
-/// goes through ITOCatch, and a configuration change rebuilds the graph instead
-/// of leaving it dead. A strange device can produce an error, never a crash.
+/// - Speakers (nothing Bluetooth): one engine with Apple's voice processing (the VPIO
+///   unit behind FaceTime): echo cancellation against what the speakers play, noise
+///   suppression, AGC. Without it your speakers feed the caller's voice back into your
+///   mic and they hear themselves. It has to hear the output, so one engine does both.
+/// - Bluetooth headphones or headset: there is no speaker-to-mic echo to cancel, and
+///   voice processing on Bluetooth refuses (-10875) or runs with a mic that delivers
+///   nothing. Two engines instead: one only listens, one only plays.
 ///
-/// Every start, and every fallback from voice processing, gets a brand new engine.
-/// An engine that has had voice processing turned on and off again plays fine but its
-/// microphone delivers nothing (seen with a USB interface in and Bluetooth out), so the
-/// caller hears silence. A watchdog checks that microphone frames actually arrive and
-/// rebuilds once more if they don't.
+/// The split is what keeps a Bluetooth headset working. Opening its mic switches the
+/// headset from music mode to call mode, which takes seconds, takes the output from
+/// 44.1 to 16 kHz and stops whatever engine plays to it. With two engines only the
+/// player is rebuilt; the mic stays open through it, so the headset stays in call mode.
+/// Closing the mic, even for a moment, sends the headset back to music mode and the
+/// next open switches it again: every switch is a chime in your ears and seconds of
+/// nothing.
+///
+/// Every (re)build is a brand new AVAudioEngine. An engine stopped by a device change
+/// keeps the old device's format and fails to start forever after (-10868), and one
+/// whose voice processing was turned off again has a mic that delivers nothing. Retries
+/// and rebuilds carry a generation number, so a stale one never runs and each side has
+/// at most one chain of them. A mic that goes quiet for [stallSeconds] is rebuilt;
+/// after [maxStalls] the user is told.
+///
+/// Engine calls that can raise an Objective-C exception go through ITOCatch: a strange
+/// device can produce an error, never a crash. Everything but the mic tap runs on the
+/// main queue.
 ///
 /// Wire format matches the phone: 16 kHz mono s16le, 320 samples (20 ms) per
 /// frame, prefixed by a big-endian u32 sequence number.
@@ -47,31 +58,52 @@ public final class CallAudio {
 
     /// Called on the audio thread.
     public var onFrame: (@Sendable (Data) -> Void)?
-    /// A rebuild after a device change failed. Main queue.
+    /// The mic is up. Main queue, once per call.
+    public var onStarted: (() -> Void)?
+    /// A side gave up: the mic never delivered, or could not be opened, or nothing plays.
+    /// Main queue, at most once per call. Whatever still works keeps running.
     public var onError: ((Error) -> Void)?
     public var muted = false
 
-    private var engine = AVAudioEngine()
-    private var player = AVAudioPlayerNode()
+    /// This call uses Apple's voice processing (one engine) rather than the split.
+    public private(set) var voiceProcessing = false
+    public private(set) var running = false
+
+    /// Long enough for a Bluetooth headset to finish switching to call mode.
+    static let stallSeconds = 6.0
+    static let maxStalls = 2
+
     private let wire = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
-    private var attached = false
-    private var observer: NSObjectProtocol?
-    private var rebuild: DispatchWorkItem?
 
-    // Audio-thread state.
-    private var converter: AVAudioConverter?
-    private var converterFrom: AVAudioFormat?
-    private var mono: AVAudioPCMBuffer?
-    private var carry: [Int16] = []
-    private var seq: UInt32 = 0
+    /// Listens; with voice processing it also plays. Not for a Bluetooth headset's mic.
+    private var mic: AVAudioEngine?
+    /// A Bluetooth headset's mic, read from the HAL instead.
+    private var headsetMic: HeadsetMic?
+    private var micGen = 0
+    /// Plays, when there is no voice processing.
+    private var speaker: AVAudioEngine?
+    private var speakerGen = 0
+    private var player: AVAudioPlayerNode?
+    private var playerEngine: AVAudioEngine?
+    private var observers: [ObjectIdentifier: NSObjectProtocol] = [:]
+    private var micRebuild: DispatchWorkItem?
+    private var speakerRebuild: DispatchWorkItem?
+    private var stallTimer: Timer?
+    private var inputListener: AudioObjectPropertyListenerBlock?
+    private var stalls = 0
+    private var started = false
+    private var failed = false
+    private var heardAt = DispatchTime(uptimeNanoseconds: 0)  // under lock: the last real mic frame
+    private var settling: Timer?
 
+    // Shared with the audio threads, under lock.
     private let lock = NSLock()
+    private var pipe: Pipe?
+    private var lastMicFrame = DispatchTime.now()
     private var queued = 0
-    private var micFrames = 0
-    private var watchdog: DispatchWorkItem?
-    private var revived = 0
-    public private(set) var running = false
+    private var playToken = 0
+    private var seq: UInt32 = 0
 
     public init() {}
 
@@ -83,110 +115,86 @@ public final class CallAudio {
         }
     }
 
-    /// Starts asynchronously. Opening the mic of a Bluetooth headset switches the whole
-    /// headset from music mode to call mode, which takes a second or two, and the voice
-    /// processor cannot start against a device that is mid-switch (-10875). So keep
-    /// trying for ~5 s. [onStarted] or [onError] says how it ended. Main queue.
-    public var onStarted: (() -> Void)?
+    /// Runs [f] once the mic is delivering and a Bluetooth headset has finished switching
+    /// to call mode (its output at the mic's rate, the player rebuilt for it): the moment
+    /// a call can connect without the switch, and its tone, landing on its first second.
+    /// Without a headset mic nothing switches, so as soon as the mic delivers. Main queue,
+    /// once; never if the audio stops first.
+    public func whenSettled(_ f: @escaping () -> Void) {
+        settling?.invalidate()
+        var steady = 0
+        settling = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] t in
+            guard let self, self.running else { return t.invalidate() }
+            lock.lock(); let heard = Double(DispatchTime.now().uptimeNanoseconds - heardAt.uptimeNanoseconds) / 1e9; lock.unlock()
+            // Only a headset whose mic is in use switches; its output then runs at the mic's rate.
+            let input = Self.defaultDevice(input: true), out = Self.defaultDevice(input: false)
+            let switched = !Self.isBluetooth(input) || !Self.isBluetooth(out) || Self.rate(out) == Self.rate(input)
+            let playing = self.voiceProcessing || self.speaker?.isRunning == true
+            steady = heard < 0.2 && switched && playing ? steady + 1 : 0
+            guard steady >= 2 else { return }
+            t.invalidate()
+            log.notice("settled")
+            f()
+        }
+    }
 
-    /// Apple's voice processing (echo cancellation) is used when the devices allow it.
-    /// Some refuse outright: a Bluetooth headset whose mic is in call mode while its output
-    /// still reports music mode fails with -10875 every time. Headphones have no
-    /// speaker-to-mic echo to cancel, so then the plain engine is the right answer.
-    public private(set) var voiceProcessing = true
-
+    /// Starts asynchronously; [onStarted] or [onError] says how it went. Main queue.
     public func start() {
         guard !running else { return }
         running = true
-        revived = 0
-        // A device that refused once refuses every time; do not spend the first seconds of a call finding out again.
-        voiceProcessing = !Self.refusesVoiceProcessing.contains(Self.defaultInputUID() ?? "")
-        log.info("start: voice processing \(self.voiceProcessing ? "on" : "off", privacy: .public)")
-        freshEngine()
-        attempt(0)
-    }
-
-    /// Throws the old engine away (if any) and makes a new one.
-    private func freshEngine() {
-        teardown()
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        engine = AVAudioEngine()
-        player = AVAudioPlayerNode()
-        attached = false
-        converter = nil
-        converterFrom = nil
-        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                                          queue: .main) { [weak self] _ in self?.scheduleRebuild() }
-    }
-
-    private func attempt(_ n: Int) {
-        guard running else { return }
-        do {
-            try configure()
-            log.info("started (attempt \(n), voice processing \(self.voiceProcessing ? "on" : "off", privacy: .public))")
-            watchMic()
-            onStarted?()
-        } catch {
-            log.error("attempt \(n) failed: \(error.localizedDescription, privacy: .public)")
-            _ = ITOCatch({
-                self.engine.inputNode.removeTap(onBus: 0)
-                self.engine.stop()
-            }, nil)
-            if voiceProcessing && n >= 2 {
-                // Refused three times in a row: not a transient switch. Go without it, on a
-                // new engine: this one's microphone would stay dead.
-                voiceProcessing = false
-                if let uid = Self.defaultInputUID() { Self.refusesVoiceProcessing.insert(uid) }
-                log.info("voice processing refused by this input; continuing without it")
-                freshEngine()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.attempt(0) }
-            } else if n < 12 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.attempt(n + 1) }
-            } else {
-                stop()
-                onError?(error)
-            }
+        started = false
+        failed = false
+        stalls = 0
+        let input = Self.defaultDevice(input: true), output = Self.defaultDevice(input: false)
+        let bluetooth = Self.isBluetooth(input) || Self.isBluetooth(output)
+        voiceProcessing = !bluetooth && !Self.refusesVoiceProcessing.contains(Self.uid(input) ?? "")
+        log.notice("start: in \(Self.describe(input), privacy: .public), out \(Self.describe(output), privacy: .public), \(self.voiceProcessing ? "voice processing" : "split engines", privacy: .public)")
+        lock.lock(); lastMicFrame = .now(); lock.unlock()
+        if !voiceProcessing { openSpeaker(0) }
+        openMic(0)
+        stallTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkMic() }
+        // The split's mic is pinned to its device, so it has to be told when you pick another.
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.inputChanged() }
+        var addr = Self.defaultInputAddress
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main, listener) == noErr {
+            inputListener = listener
         }
-    }
-
-    /// Started is not the same as hearing you. If the microphone delivers nothing within a
-    /// second and a half, rebuild on a new engine; twice without luck is an error the user sees.
-    private func watchMic() {
-        watchdog?.cancel()
-        lock.lock(); micFrames = 0; lock.unlock()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.running else { return }
-            self.lock.lock(); let got = self.micFrames; self.lock.unlock()
-            guard got == 0 else { return }
-            log.error("microphone delivered nothing (revive \(self.revived))")
-            if self.revived >= 2 {
-                self.onError?(AudioError.noInput)
-                return
-            }
-            self.revived += 1
-            self.freshEngine()
-            self.attempt(0)
-        }
-        watchdog = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     public func stop() {
         guard running else { return }
         running = false
-        log.info("stop")
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
-        rebuild?.cancel()
-        watchdog?.cancel()
-        teardown()
+        settling?.invalidate()
+        settling = nil
+        micGen += 1
+        speakerGen += 1
+        micRebuild?.cancel()
+        speakerRebuild?.cancel()
+        stallTimer?.invalidate()
+        stallTimer = nil
+        if let inputListener {
+            var addr = Self.defaultInputAddress
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main, inputListener)
+        }
+        inputListener = nil
+        if let mic { closeMic(mic) }
+        if let speaker { closeSpeaker(speaker) }
+        headsetMic?.stop()
+        headsetMic = nil
+        mic = nil
+        speaker = nil
+        player = nil
+        playerEngine = nil
+        lock.lock(); pipe = nil; queued = 0; playToken += 1; lock.unlock()
+        log.notice("stop")
     }
 
     /// Downlink from the phone. Past ~160 ms of backlog new frames are dropped: late audio is worse than lost audio.
     public func play(_ frame: Data) {
-        guard running, engine.isRunning, frame.count == 4 + 640 else { return }
+        guard running, let player, let engine = playerEngine, engine.isRunning, frame.count == 4 + 640 else { return }
         lock.lock()
         let backlog = queued
+        let token = playToken
         lock.unlock()
         guard backlog < 8, let buf = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: 320) else { return }
         buf.frameLength = 320
@@ -205,13 +213,12 @@ public final class CallAudio {
         if ringback && !lineHasSound { synthRingback(dst) }
         if toneLeft > 0 { mixTone(dst) }
         lock.lock(); queued += 1; lock.unlock()
-        let scheduled = ITOCatch({
-            self.player.scheduleBuffer(buf) { [weak self] in
-                guard let self else { return }
-                self.lock.lock(); self.queued -= 1; self.lock.unlock()
-            }
-        }, nil)
-        if !scheduled { lock.lock(); queued -= 1; lock.unlock() }
+        // A rebuilt player starts its count from zero; the old one's callbacks must not touch it.
+        let done: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); if self.playToken == token { self.queued -= 1 }; self.lock.unlock()
+        }
+        if !ITOCatch({ player.scheduleBuffer(buf, completionHandler: done) }, nil) { done() }
     }
 
     // MARK: tones the phone would have played locally
@@ -268,77 +275,226 @@ public final class CallAudio {
         }
     }
 
-    // MARK: graph
+    // MARK: engines
 
-    private func configure() throws {
-        let input = engine.inputNode
-        if voiceProcessing {
-            if !input.isVoiceProcessingEnabled { try step("voice processing") { try input.setVoiceProcessingEnabled(true) } }
-            input.voiceProcessingOtherAudioDuckingConfiguration =
-                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
-        }
-        try step("player") { try objc {
-            if !self.attached {
-                self.engine.attach(self.player)
-                self.attached = true
-            }
-            self.engine.connect(self.player, to: self.engine.mainMixerNode, format: self.playFormat)
-        } }
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.noInput }
-        try step("mic tap") { try objc {
-            input.removeTap(onBus: 0)
-            // format nil = exactly what the bus produces now; never a stale guess.
-            input.installTap(onBus: 0, bufferSize: 960, format: nil) { [weak self] buf, _ in self?.captured(buf) }
-        } }
-        engine.prepare()
-        try step("engine start") { try engine.start() }
-        try step("playback") { try objc { self.player.play() } }
-        lock.lock(); queued = 0; lock.unlock()
-    }
-
-    private func teardown() {
-        _ = ITOCatch({
-            self.engine.inputNode.removeTap(onBus: 0)
-            self.player.stop()
-            self.engine.stop()
-        }, nil)
-        lock.lock(); queued = 0; lock.unlock()
-    }
-
-    /// Device changes come in bursts (a headset switching profiles sends several). Rebuild once, after they settle.
-    private func scheduleRebuild() {
+    /// A new engine for the mic (and, with voice processing, the player). On failure it
+    /// tries again on another new engine; without voice processing the old engine is
+    /// closed only once the new one runs, so the mic is never let go.
+    private func openMic(_ attempt: Int) {
         guard running else { return }
-        rebuild?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.running else { return }
-            _ = ITOCatch({
-                self.engine.inputNode.removeTap(onBus: 0)
-                self.engine.stop()
-            }, nil)
-            self.attempt(0)
+        micGen += 1
+        let gen = micGen
+        if !voiceProcessing && Self.isBluetooth(Self.defaultDevice(input: true)) { return openHeadsetMic(attempt, gen) }
+        // Two voice-processing units in one process fight; that path has no Bluetooth to keep in call mode.
+        if voiceProcessing, let old = mic { closeMic(old); mic = nil; player = nil; playerEngine = nil }
+        let engine = AVAudioEngine()
+        let pipe = Pipe(processed: voiceProcessing)
+        var node: AVAudioPlayerNode?
+        let format: AVAudioFormat
+        do {
+            let input = engine.inputNode
+            if voiceProcessing {
+                try step("voice processing") { try input.setVoiceProcessingEnabled(true) }
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+                let p = AVAudioPlayerNode()
+                try step("player") { try objc {
+                    engine.attach(p)
+                    engine.connect(p, to: engine.mainMixerNode, format: self.playFormat)
+                } }
+                node = p
+            } else if let unit = input.audioUnit {
+                // Left on the default, the engine listens through an aggregate of the default
+                // input and output, and the output switching modes knocks the mic over with it.
+                var device = Self.defaultDevice(input: true)
+                let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                                  &device, UInt32(MemoryLayout<AudioObjectID>.size))
+                if status != noErr { log.error("could not pin the mic to its device: \(status)") }
+            }
+            format = input.outputFormat(forBus: 0)
+            guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.noInput }
+            try step("mic tap") { try objc {
+                // format nil = exactly what the bus produces now.
+                input.installTap(onBus: 0, bufferSize: 960, format: nil) { [weak self] buf, _ in self?.captured(buf, pipe) }
+            } }
+            engine.prepare()
+            try step("mic start") { try engine.start() }
+            if let node { try step("playback") { try objc { node.play() } } }
+        } catch {
+            closeMic(engine)
+            log.error("mic attempt \(attempt) failed: \(error.localizedDescription, privacy: .public)")
+            if voiceProcessing && attempt >= 1 { return fallBackFromVoiceProcessing() }
+            guard attempt < 15 else { return giveUp(error) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.running, self.micGen == gen else { return }
+                self.openMic(attempt + 1)
+            }
+            return
         }
-        rebuild = work
+        let old = mic
+        mic = engine
+        lock.lock(); self.pipe = pipe; lastMicFrame = .now(); lock.unlock()
+        if let old { closeMic(old) }
+        headsetMic?.stop()
+        headsetMic = nil
+        if let node { setPlayer(node, on: engine) }
+        observe(engine, mic: true, gen)
+        log.notice("mic up (attempt \(attempt)): \(Int(format.sampleRate)) Hz × \(format.channelCount)")
+        if !started { started = true; onStarted?() }
+    }
+
+    /// A Bluetooth headset's mic, straight from the HAL (see [HeadsetMic]). A new one
+    /// starts before the old one stops, so the headset never sees its mic closed.
+    private func openHeadsetMic(_ attempt: Int, _ gen: Int) {
+        let device = Self.defaultDevice(input: true)
+        let pipe = Pipe(processed: false)
+        let tap = HeadsetMic(device) { [weak self] buf in self?.captured(buf, pipe) }
+        do {
+            try tap.start()
+        } catch {
+            log.error("headset mic attempt \(attempt) failed: \(error.localizedDescription, privacy: .public)")
+            guard attempt < 15 else { return giveUp(error) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.running, self.micGen == gen else { return }
+                self.openMic(attempt + 1)
+            }
+            return
+        }
+        let old = headsetMic
+        headsetMic = tap
+        lock.lock(); self.pipe = pipe; lastMicFrame = .now(); lock.unlock()
+        old?.stop()
+        if let mic { closeMic(mic); self.mic = nil }
+        log.notice("mic up (attempt \(attempt)): headset, \(Int(Self.rate(device))) Hz")
+        if !started { started = true; onStarted?() }
+    }
+
+    /// A new engine that only plays. Never touches its inputNode: that would open the mic.
+    private func openSpeaker(_ attempt: Int) {
+        guard running, !voiceProcessing else { return }
+        speakerGen += 1
+        let gen = speakerGen
+        let engine = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        do {
+            try step("player") { try objc {
+                engine.attach(node)
+                engine.connect(node, to: engine.mainMixerNode, format: self.playFormat)
+            } }
+            engine.prepare()
+            try step("speaker start") { try engine.start() }
+            try step("playback") { try objc { node.play() } }
+        } catch {
+            closeSpeaker(engine)
+            log.error("speaker attempt \(attempt) failed: \(error.localizedDescription, privacy: .public)")
+            guard attempt < 15 else { return giveUp(error) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.running, self.speakerGen == gen else { return }
+                self.openSpeaker(attempt + 1)
+            }
+            return
+        }
+        let old = speaker
+        speaker = engine
+        setPlayer(node, on: engine)
+        if let old { closeSpeaker(old) }
+        observe(engine, mic: false, gen)
+        let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        log.notice("speaker up (attempt \(attempt)): \(Int(rate)) Hz")
+    }
+
+    private func closeMic(_ engine: AVAudioEngine) {
+        unobserve(engine)
+        _ = ITOCatch({
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }, nil)
+    }
+
+    private func closeSpeaker(_ engine: AVAudioEngine) {
+        unobserve(engine)
+        _ = ITOCatch({ engine.stop() }, nil)
+    }
+
+    private func setPlayer(_ node: AVAudioPlayerNode, on engine: AVAudioEngine) {
+        lock.lock(); playToken += 1; queued = 0; lock.unlock()
+        player = node
+        playerEngine = engine
+    }
+
+    private func observe(_ engine: AVAudioEngine, mic isMic: Bool, _ gen: Int) {
+        observers[ObjectIdentifier(engine)] = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.deviceChanged(mic: isMic, gen) }
+    }
+
+    private func unobserve(_ engine: AVAudioEngine) {
+        if let o = observers.removeValue(forKey: ObjectIdentifier(engine)) { NotificationCenter.default.removeObserver(o) }
+    }
+
+    /// The engine's device changed under it, which stops it. Changes come in bursts (a
+    /// headset switching modes sends several), so rebuild once they settle, and only if
+    /// it really stopped.
+    private func deviceChanged(mic isMic: Bool, _ gen: Int) {
+        guard running, gen == (isMic ? micGen : speakerGen) else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.running, gen == (isMic ? self.micGen : self.speakerGen) else { return }
+            if let e = isMic ? self.mic : self.speaker, e.isRunning { return }
+            log.notice("\(isMic ? "mic" : "speaker", privacy: .public) device changed; new engine")
+            if isMic { self.openMic(0) } else { self.openSpeaker(0) }
+        }
+        if isMic { micRebuild?.cancel(); micRebuild = work } else { speakerRebuild?.cancel(); speakerRebuild = work }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
-    private static var refusesVoiceProcessing: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: "ito.vpRefused") ?? []) }
-        set { UserDefaults.standard.set(Array(newValue), forKey: "ito.vpRefused") }
+    /// You picked another input mid-call. Voice processing's engine follows the default by itself.
+    private func inputChanged() {
+        guard running, !voiceProcessing else { return }
+        var device = headsetMic?.device ?? 0
+        if let unit = mic?.inputNode.audioUnit {
+            var size = UInt32(MemoryLayout<AudioObjectID>.size)
+            AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size)
+        }
+        guard device != Self.defaultDevice(input: true) else { return }
+        log.notice("input is now \(Self.describe(Self.defaultDevice(input: true)), privacy: .public); new mic engine")
+        micRebuild?.cancel()
+        openMic(0)
     }
 
-    /// The current default input device's persistent UID (survives reconnects, unlike its id).
-    static func defaultInputUID() -> String? {
-        var id = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
-                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr else { return nil }
-        var uid: Unmanaged<CFString>?
-        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        addr.mSelector = kAudioDevicePropertyDeviceUID
-        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &uid) == noErr else { return nil }
-        return uid?.takeRetainedValue() as String?
+    /// Once a second: started is not the same as hearing you.
+    private func checkMic() {
+        guard running, !failed else { return }
+        lock.lock(); let quiet = Double(DispatchTime.now().uptimeNanoseconds - lastMicFrame.uptimeNanoseconds) / 1e9; lock.unlock()
+        guard quiet > Self.stallSeconds else { return }
+        stalls += 1
+        log.error("mic delivered nothing for \(Int(quiet)) s (stall \(self.stalls))")
+        if stalls > Self.maxStalls { return giveUp(AudioError.noInput) }
+        if voiceProcessing { return fallBackFromVoiceProcessing() }
+        micRebuild?.cancel()
+        openMic(0)
+        lock.lock(); lastMicFrame = .now(); lock.unlock()
+    }
+
+    /// Voice processing refused twice, or ran with a deaf mic: this input gets the split from now on.
+    private func fallBackFromVoiceProcessing() {
+        guard running, voiceProcessing else { return }
+        voiceProcessing = false
+        if let uid = Self.uid(Self.defaultDevice(input: true)) { Self.refusesVoiceProcessing.insert(uid) }
+        log.notice("voice processing refused or deaf on this input; split engines")
+        if let mic { closeMic(mic) }
+        mic = nil
+        player = nil
+        playerEngine = nil
+        lock.lock(); pipe = nil; lastMicFrame = .now(); lock.unlock()
+        openSpeaker(0)
+        openMic(0)
+    }
+
+    private func giveUp(_ error: Error) {
+        guard !failed else { return }
+        failed = true
+        log.error("call audio gave up: \(error.localizedDescription, privacy: .public)")
+        onError?(error)
     }
 
     private func objc(_ block: () -> Void) throws {
@@ -346,31 +502,181 @@ public final class CallAudio {
         if !ITOCatch(block, &error) { throw error ?? AudioError.noInput }
     }
 
+    // MARK: devices
+
+    private static var refusesVoiceProcessing: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "ito.vpRefused") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "ito.vpRefused") }
+    }
+
+    private static var defaultInputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+
+    static func defaultDevice(input: Bool) -> AudioObjectID {
+        var id = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return id
+    }
+
+    private static func string(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard id != 0, AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr else { return nil }
+        return value?.takeRetainedValue() as String?
+    }
+
+    /// The device's persistent UID (survives reconnects, unlike its id).
+    static func uid(_ id: AudioObjectID) -> String? { string(id, kAudioDevicePropertyDeviceUID) }
+
+    static func isBluetooth(_ id: AudioObjectID) -> Bool {
+        var transport = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard id != 0, AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &transport) == noErr else { return false }
+        return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    static func rate(_ id: AudioObjectID) -> Float64 {
+        var rate = Float64(0)
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate)
+        return rate
+    }
+
+    static func describe(_ id: AudioObjectID) -> String {
+        "\(string(id, kAudioObjectPropertyName) ?? "none") @\(Int(rate(id)))\(isBluetooth(id) ? " bluetooth" : "")"
+    }
+
+    // MARK: a Bluetooth headset's mic
+
+    /// A Bluetooth headset's mic read straight from the HAL, with an IOProc. An
+    /// AVAudioEngine stops itself on every device change, and a headset switching to call
+    /// mode changes several times; an engine reopened mid-switch can hang for seconds and
+    /// then fail (-10868), and while the mic is closed the headset drops back to music
+    /// mode and switches again, tone after tone. An IOProc stays started through the
+    /// changes and the HAL hands it the mic in whatever format the device has now. It
+    /// is called on its own queue rather than the realtime thread: the conversion
+    /// allocates. Only for this: an engine opening a mic an IOProc holds takes seconds.
+    private final class HeadsetMic {
+        let device: AudioObjectID
+        private let deliver: (AVAudioPCMBuffer) -> Void
+        private let queue = DispatchQueue(label: "app.ito.headset-mic", qos: .userInteractive)
+        private var proc: AudioDeviceIOProcID?
+        private var mono: AVAudioPCMBuffer?  // queue
+
+        init(_ device: AudioObjectID, deliver: @escaping (AVAudioPCMBuffer) -> Void) {
+            self.device = device
+            self.deliver = deliver
+        }
+
+        func start() throws {
+            var proc: AudioDeviceIOProcID?
+            var status = AudioDeviceCreateIOProcIDWithBlock(&proc, device, queue) { [weak self] _, input, _, _, _ in
+                self?.received(input)
+            }
+            guard status == noErr, let proc else { throw Self.error("open", status) }
+            status = AudioDeviceStart(device, proc)
+            guard status == noErr else {
+                AudioDeviceDestroyIOProcID(device, proc)
+                throw Self.error("start", status)
+            }
+            self.proc = proc
+        }
+
+        func stop() {
+            guard let proc else { return }
+            AudioDeviceStop(device, proc)
+            AudioDeviceDestroyIOProcID(device, proc)
+            self.proc = nil
+        }
+
+        /// The first channel of the first stream, as mono float at the device's rate.
+        private func received(_ input: UnsafePointer<AudioBufferList>) {
+            let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            guard let first = list.first, let data = first.mData, first.mNumberChannels > 0 else { return }
+            var asbd = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamFormat,
+                                                  mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+            guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &asbd) == noErr,
+                  asbd.mFormatID == kAudioFormatLinearPCM, asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+                  asbd.mBitsPerChannel == 32, asbd.mSampleRate > 0 else { return }
+            let channels = Int(first.mNumberChannels)
+            let frames = Int(first.mDataByteSize) / (4 * channels)
+            guard frames > 0 else { return }
+            if mono?.format.sampleRate != asbd.mSampleRate || (mono?.frameCapacity ?? 0) < AVAudioFrameCount(frames) {
+                let f = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: asbd.mSampleRate, channels: 1, interleaved: false)!
+                mono = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: AVAudioFrameCount(max(frames, 4096)))
+            }
+            guard let mono, let dst = mono.floatChannelData?[0] else { return }
+            let src = data.assumingMemoryBound(to: Float.self)
+            for i in 0..<frames { dst[i] = src[i * channels] }
+            mono.frameLength = AVAudioFrameCount(frames)
+            deliver(mono)
+        }
+
+        private static func error(_ what: String, _ status: OSStatus) -> Error {
+            NSError(domain: "app.ito.headset-mic", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "\(what): \(status)"])
+        }
+    }
+
     // MARK: microphone → wire
 
-    private func captured(_ buf: AVAudioPCMBuffer) {
+    /// Conversion state for one mic engine. A new engine gets a new pipe, so a rebuild
+    /// never shares a converter with the tap it replaces, and a replaced tap goes silent.
+    private final class Pipe {
+        /// Voice processing's first channel is the processed voice. Otherwise several
+        /// channels are several inputs (a USB interface's 1 and 2), and the mic can be on any.
+        let processed: Bool
+        init(processed: Bool) { self.processed = processed }
+        var converter: AVAudioConverter?
+        var from: AVAudioFormat?
+        var mono: AVAudioPCMBuffer?
+        var carry: [Int16] = []
+    }
+
+    private func captured(_ buf: AVAudioPCMBuffer, _ pipe: Pipe) {
         guard buf.frameLength > 0 else { return }
-        lock.lock(); micFrames += 1; lock.unlock()
-        // Voice processing can report several channels; the processed voice is the first.
-        // Take it alone, so the converter only ever resamples mono → mono.
+        lock.lock()
+        let current = self.pipe === pipe
+        if current { lastMicFrame = .now(); heardAt = lastMicFrame }
+        lock.unlock()
+        guard current else { return }
+        // Several channels become one before resampling, so the converter only ever does
+        // mono → mono: voice processing's first channel, or else all inputs mixed.
         let source: AVAudioPCMBuffer
         if buf.format.channelCount > 1, let ch = buf.floatChannelData {
-            if mono?.format.sampleRate != buf.format.sampleRate || (mono?.frameCapacity ?? 0) < buf.frameLength {
+            if pipe.mono?.format.sampleRate != buf.format.sampleRate || (pipe.mono?.frameCapacity ?? 0) < buf.frameLength {
                 let f = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: buf.format.sampleRate, channels: 1, interleaved: false)!
-                mono = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: max(buf.frameLength, 4096))
+                pipe.mono = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: max(buf.frameLength, 4096))
             }
-            guard let m = mono else { return }
+            guard let m = pipe.mono else { return }
+            let n = Int(buf.frameLength)
             m.frameLength = buf.frameLength
-            m.floatChannelData![0].update(from: ch[0], count: Int(buf.frameLength))
+            let dst = m.floatChannelData![0]
+            dst.update(from: ch[0], count: n)
+            if !pipe.processed {
+                let count = Int(buf.format.channelCount)
+                for c in 1..<count { for i in 0..<n { dst[i] += ch[c][i] } }
+                let scale = 1 / Float(count)
+                for i in 0..<n { dst[i] *= scale }
+            }
             source = m
         } else {
             source = buf
         }
-        if converterFrom != source.format {
-            converter = AVAudioConverter(from: source.format, to: wire)
-            converterFrom = source.format
+        if pipe.from != source.format {
+            pipe.converter = AVAudioConverter(from: source.format, to: wire)
+            pipe.from = source.format
         }
-        guard let conv = converter else { return }
+        guard let conv = pipe.converter else { return }
         let cap = AVAudioFrameCount(Double(source.frameLength) * 16_000 / source.format.sampleRate) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: wire, frameCapacity: cap) else { return }
         var fed = false
@@ -383,17 +689,17 @@ public final class CallAudio {
             return source
         }
         guard err == nil, out.frameLength > 0, let p = out.int16ChannelData?[0] else { return }
-        carry.append(contentsOf: UnsafeBufferPointer(start: p, count: Int(out.frameLength)))
-        while carry.count >= 320 {
+        pipe.carry.append(contentsOf: UnsafeBufferPointer(start: p, count: Int(out.frameLength)))
+        while pipe.carry.count >= 320 {
+            lock.lock(); let n = seq; seq &+= 1; lock.unlock()
             var frame = Data(capacity: 4 + 640)
-            withUnsafeBytes(of: seq.bigEndian) { frame.append(contentsOf: $0) }
-            seq &+= 1
+            withUnsafeBytes(of: n.bigEndian) { frame.append(contentsOf: $0) }
             if muted {
                 frame.append(Data(count: 640))
             } else {
-                for s in carry[0..<320] { withUnsafeBytes(of: s.littleEndian) { frame.append(contentsOf: $0) } }
+                for s in pipe.carry[0..<320] { withUnsafeBytes(of: s.littleEndian) { frame.append(contentsOf: $0) } }
             }
-            carry.removeFirst(320)
+            pipe.carry.removeFirst(320)
             onFrame?(frame)
         }
     }

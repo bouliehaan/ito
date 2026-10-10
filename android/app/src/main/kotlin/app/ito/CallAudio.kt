@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
@@ -115,11 +116,22 @@ class CallAudio(private val ctx: Context) {
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val silence = ByteArray(FRAME_BYTES)
+            var live = false
+            var heardAt = 0L // the Mac's last frame
+            var runFrom = 0L // when its current unbroken run began
             while (running) {
                 // Keep the uplink fed: silence when the Mac is late, never a gap.
                 val f = inbox.poll(40, TimeUnit.MILLISECONDS)
                 val pcm = if (f != null && f.size == 4 + FRAME_BYTES) f.copyOfRange(4, f.size) else silence
-                if (pcm === silence) upStarved++ else { upFrames++; upPeak = maxOf(upPeak, peak(pcm)) }
+                val now = SystemClock.elapsedRealtime()
+                if (pcm === silence) upStarved++ else {
+                    upFrames++
+                    upPeak = maxOf(upPeak, peak(pcm))
+                    if (now - heardAt > MAC_GONE_MS) runFrom = now
+                    heardAt = now
+                }
+                val isLive = now - heardAt < MAC_GONE_MS && heardAt - runFrom >= MAC_LIVE_MS
+                if (isLive != live) { live = isLive; onMacLive?.invoke(live) }
                 trk.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
             }
         }, "ito-uplink").start()
@@ -132,6 +144,13 @@ class CallAudio(private val ctx: Context) {
 
     /** The Mac's microphone stopped arriving (or never did) during a call. Audio thread. */
     @Volatile var onMacQuiet: (() -> Unit)? = null
+
+    /**
+     * The Mac's microphone is arriving (true: [MAC_LIVE_MS] of it unbroken) or has stopped
+     * (false: nothing for [MAC_GONE_MS]). Only a live Mac may take the phone's mic away.
+     * Uplink thread.
+     */
+    @Volatile var onMacLive: ((Boolean) -> Unit)? = null
 
     @Volatile private var lastProblem: String? = null
     @Volatile private var downFrames = 0L
@@ -176,7 +195,8 @@ class CallAudio(private val ctx: Context) {
     /**
      * You. First choice: Qualcomm's in-call music ("incall_music_uplink"), which mixes a
      * playback stream into the uplink. It does NOT mute the phone's own mic by itself; it
-     * makes a call mute act on the mic alone, so Calls mutes the call once this runs. Audio
+     * makes a call mute act on the mic alone, so Calls mutes the call while the Mac's
+     * voice is actually arriving ([onMacLive]). Audio
      * policy only selects it for a track routed explicitly to the Telephony Tx device, and
      * on the V60 that needs two things the Magisk module supplies: the HAL feature
      * property and an incall_music → Telephony Tx route in the policy file.
@@ -264,6 +284,8 @@ class CallAudio(private val ctx: Context) {
         const val RATE = 16_000
         const val FRAME_BYTES = 640
         private const val MAX_BACKLOG = 6
+        private const val MAC_LIVE_MS = 300L
+        private const val MAC_GONE_MS = 1500L
         private const val TAG = "ito-audio"
     }
 }

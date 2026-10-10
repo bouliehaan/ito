@@ -78,15 +78,21 @@ final class AppModel: ObservableObject, LinkDelegate {
     private var contactRows: [[String: Any]] = []
     private var partChunks: [Int64: [Int: Data]] = [:]
     private var wantAudio: String?
+    /// The call whose audio the phone has carried here. Before that, a call this Mac dialed
+    /// or answered already has its audio running here, with nothing on the wire yet.
+    private var hadAudio: String?
+    private var earlyStart = 0
     private var selectNumberAfterSend: String?
     private var selectGroupCid: String?
     private var notifyAfterSms: Int64 = .max
     private var notifyAfterCall: Int64 = .max
 
     init() {
-        // The debug-only snapshot run (see App.swift) must not touch the real Keychain or history.
+        // The debug-only snapshot and audio test runs (see App.swift) must not touch the real
+        // Keychain or history, nor knock the real ito off the link with the same key.
         #if DEBUG
-        let scratch = ProcessInfo.processInfo.environment["ITO_SNAPSHOT"] != nil
+        let env = ProcessInfo.processInfo.environment
+        let scratch = env["ITO_SNAPSHOT"] != nil || env["ITO_AUDIOTEST"] != nil || env["ITO_CALLTEST"] != nil
         #else
         let scratch = false
         #endif
@@ -431,14 +437,44 @@ final class AppModel: ObservableObject, LinkDelegate {
         guard !n.isEmpty else { return }
         wantAudio = "dial"
         callMuted = false
+        // Audio now, not when the phone reports the call: a Bluetooth headset switches to
+        // call mode (and plays its tone) while the phone dials, before anyone picks up.
+        startAudioEarly()
         link.send(["t": "dial", "n": n])
     }
 
+    /// Answers once a Bluetooth headset has switched to call mode, so its tone and the
+    /// switch come before the caller's hello instead of over it. They hear one more ring
+    /// at most; never more than 2.5 s.
     func answer() {
         guard let c = call else { return }
         wantAudio = c.id
         callMuted = false
-        link.send(["t": "answer", "id": c.id])
+        let id = c.id
+        var sent = false
+        let send = { [weak self] in
+            guard let self, !sent else { return }
+            sent = true
+            guard self.call?.id == id, self.call?.state == "ringing" else { return }
+            self.link.send(["t": "answer", "id": id])
+        }
+        startAudioEarly()
+        audio.whenSettled(send)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: send)
+    }
+
+    /// The call's audio before the phone carries it. If the phone never does (the dial
+    /// failed, the call went elsewhere), let the mic and the headset go again.
+    private func startAudioEarly() {
+        startAudio()
+        earlyStart += 1
+        let token = earlyStart
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.earlyStart == token, self.hadAudio == nil || self.hadAudio != self.wantAudio else { return }
+            self.stopAudio()
+            // A dial the phone never placed: a call placed later on the phone itself stays there.
+            if self.wantAudio == "dial" { self.wantAudio = nil }
+        }
     }
 
     func decline() { if let c = call { link.send(["t": "decline", "id": c.id]) } }
@@ -483,6 +519,7 @@ final class AppModel: ObservableObject, LinkDelegate {
                 notifier.clearCall()
                 call = info
                 wantAudio = nil
+                hadAudio = nil
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
                     if self?.call?.state == "ended" { self?.call = nil }
                 }
@@ -502,7 +539,14 @@ final class AppModel: ObservableObject, LinkDelegate {
         audio.ringback = info.dir == "out" && info.state == "dialing"
         if info.state == "ringing" && !wasRinging { notifier.ringing(from: info.title) }
         if info.state != "ringing" { notifier.clearCall() }
-        if info.audio && wantAudio == info.id { startAudio() } else if !info.audio { stopAudio() }
+        // A call this Mac wants with no audio yet is still connecting: keep the audio started
+        // early. Audio that was here and is gone was taken back (to the phone): let go.
+        if info.audio && wantAudio == info.id {
+            hadAudio = info.id
+            startAudio()
+        } else if !info.audio && (wantAudio != info.id || hadAudio == info.id) {
+            stopAudio()
+        }
     }
 
     private func startAudio() {
@@ -514,8 +558,8 @@ final class AppModel: ObservableObject, LinkDelegate {
         CallAudio.requestMic { [weak self] ok in
             guard let self else { return }
             guard ok else { self.notice = "ito needs the microphone for calls (system settings → privacy → microphone)"; return }
-            // The permission prompt can outlast the call: start only if this call still wants audio here.
-            guard let c = self.call, c.audio, self.wantAudio == c.id else { return self.stopAudio() }
+            // The permission prompt can outlast the call: start only if a call still wants audio here.
+            guard self.wantAudio != nil else { return self.stopAudio() }
             self.audio.start()
         }
     }
@@ -544,6 +588,8 @@ final class CallStats: @unchecked Sendable {
 
     func into(_ f: Data) { let p = Self.peak(f); lock.lock(); inFrames += 1; inPeak = max(inPeak, p); lock.unlock() }
     func out(_ f: Data) { let p = Self.peak(f); lock.lock(); outFrames += 1; outPeak = max(outPeak, p); lock.unlock() }
+    /// Mic frames sent to the phone so far.
+    var sent: Int { lock.lock(); defer { lock.unlock() }; return outFrames }
 
     func report() -> String {
         lock.lock(); defer { lock.unlock() }

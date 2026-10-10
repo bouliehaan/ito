@@ -55,8 +55,9 @@ class Calls(private val bridge: Bridge) {
         a.onMacQuiet = {
             Log.w("ito-calls", "no microphone from the Mac")
             audioOwner?.post(JSONObject().put("t", "error").put("for", "audio")
-                .put("msg", "the call isn't getting your Mac's microphone. they can't hear you; \"move to phone\" hands it back"))
+                .put("msg", "the call isn't getting your Mac's microphone, so the phone's own mic is on"))
         }
+        a.onMacLive = { live -> main.post { macMicLive(live) } }
     }
     @Volatile private var audioOwner: PhoneLink.Session? = null
     @Volatile private var audioCall: String? = null
@@ -184,11 +185,9 @@ class Calls(private val bridge: Bridge) {
 
     /**
      * While a Mac carries the call, the phone itself stays out of it: the call is held on
-     * the earpiece (never the loudspeaker) at the lowest volume, and its mic is muted.
-     * In-call music does not silence the phone's mic on its own; what it does is make a
-     * call mute act on the mic alone, so the Mac's voice keeps flowing while the phone's
-     * mic is off. (Muting before in-call music runs would silence the Mac too, so only
-     * then.) Volume and mic come back afterwards.
+     * the earpiece (never the loudspeaker) at the lowest volume, and its mic is muted
+     * while, and only while, the Mac's mic is really arriving (see [macMicLive]). Volume
+     * and mic come back afterwards.
      */
     @Suppress("DEPRECATION")
     private fun quietPhone(on: Boolean) {
@@ -200,15 +199,27 @@ class Calls(private val bridge: Bridge) {
                 quietSince = System.currentTimeMillis()
                 service?.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
                 am.setStreamVolume(stream, am.getStreamMinVolume(stream), 0)
-                if (audio.uplinkVia == "in-call music" && service?.callAudioState?.isMuted != true) {
-                    prefs.edit().putBoolean(MUTED_BY_ITO, true).commit()
-                    service?.setMuted(true)
-                    Log.i("ito-calls", "phone mic muted while the Mac carries the call")
-                }
             } else {
                 restoreVolume()
             }
         }.onFailure { Log.w("ito-calls", "could not quiet the phone: $it") }
+    }
+
+    /**
+     * The phone's mic is off only while the Mac's voice is actually reaching the call,
+     * and back on the moment it stops. Muting it as soon as the Mac took the call left
+     * calls with no voice at all whenever the Mac's mic failed to start; this way the
+     * worst case is the phone's mic, never silence. In-call music does not silence the
+     * phone's mic on its own; it makes a call mute act on the mic alone, so the Mac's
+     * voice keeps flowing while the phone's mic is off. Main thread.
+     */
+    private fun macMicLive(live: Boolean) {
+        if (audioCall == null) return
+        if (!live) return unmutePhone()
+        if (audio.uplinkVia != "in-call music" || service?.callAudioState?.isMuted == true) return
+        prefs.edit().putBoolean(MUTED_BY_ITO, true).commit()
+        runCatching { service?.setMuted(true) }.onFailure { Log.w("ito-calls", "could not mute the phone: $it") }
+        Log.i("ito-calls", "Mac mic arriving: phone mic muted")
     }
 
     /** Also called at every start: undo a quieting that a crash or restart left behind. */
