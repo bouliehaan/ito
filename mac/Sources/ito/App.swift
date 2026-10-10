@@ -1,4 +1,5 @@
 import AppKit
+import CoreAudio
 import ItoKit
 import SwiftUI
 
@@ -34,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: CallPanelController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        // Before the model exists, so this never touches the link or the real store.
+        if ProcessInfo.processInfo.environment["ITO_AUDIOTEST"] != nil { return AudioTest.run() }
+        #endif
         panel = CallPanelController(model: model)
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
@@ -84,7 +89,7 @@ enum Snapshot {
                 while !ok() && Date() < end { try? await Task.sleep(for: .milliseconds(100)) }
                 if !ok() { print("snapshot: timed out waiting for \(what)") }
             }
-            func snap(_ name: String, window: NSWindow? = nil) async {
+            @MainActor func snap(_ name: String, window: NSWindow? = nil) async {
                 try? await Task.sleep(for: .milliseconds(700))
                 guard let w = window ?? NSApp.windows.first(where: { $0.title == "ito" }), let v = w.contentView,
                       let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return print("snapshot: no window for \(name)") }
@@ -119,6 +124,79 @@ enum Snapshot {
             await snap("6-call", window: NSApp.windows.first { $0 is NSPanel })
             NSApp.terminate(nil)
         }
+    }
+}
+#endif
+
+#if DEBUG
+/// Dev only: run the call-audio engine on this Mac's real devices for 3 s, no phone.
+/// Feeds a 440 Hz tone in as the "downlink", counts microphone frames out, prints, quits.
+@MainActor
+enum AudioTest {
+    static func run() {
+        let audio = CallAudio()
+        let frames = Counter()
+        audio.onFrame = { _ in frames.bump() }
+        audio.onError = {
+            print("audiotest: failed: \($0.localizedDescription)")
+            exit(1)
+        }
+        print("audiotest: devices: \(AudioTest.devices())")
+        let began = Date()
+        audio.onStarted = {
+            print("audiotest: started after \(String(format: "%.1f", Date().timeIntervalSince(began))) s · voice processing \(audio.voiceProcessing ? "on" : "off") · devices now: \(AudioTest.devices())")
+            feed(audio, frames)
+        }
+        audio.start()
+    }
+
+    static func feed(_ audio: CallAudio, _ frames: Counter) {
+        guard frames.value == 0 else { return }
+        var phase = 0.0
+        var seq: UInt32 = 0
+        Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { t in
+            var f = Data(capacity: 644)
+            withUnsafeBytes(of: seq.bigEndian) { f.append(contentsOf: $0) }
+            seq &+= 1
+            for _ in 0..<320 {
+                let v = Int16(sin(phase) * (seq < 40 ? 4000 : 0))   // ~0.8 s of tone, then silence
+                withUnsafeBytes(of: v.littleEndian) { f.append(contentsOf: $0) }
+                phase += 2 * .pi * 440 / 16_000
+            }
+            audio.play(f)
+            if seq >= 150 {
+                t.invalidate()
+                audio.stop()
+                print("audiotest: mic frames out = \(frames.value) (expect ~150)")
+                exit(frames.value > 50 ? 0 : 2)
+            }
+        }
+    }
+
+    static func devices() -> String {
+        func name(_ sel: AudioObjectPropertySelector) -> String {
+            var id = AudioObjectID(0)
+            var size = UInt32(MemoryLayout<AudioObjectID>.size)
+            var addr = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr else { return "?" }
+            var cf: Unmanaged<CFString>?
+            size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            addr.mSelector = kAudioObjectPropertyName
+            guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &cf) == noErr, let s = cf?.takeRetainedValue() else { return "?" }
+            var rate = Float64(0)
+            size = UInt32(MemoryLayout<Float64>.size)
+            addr.mSelector = kAudioDevicePropertyNominalSampleRate
+            AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate)
+            return "\(s) @\(Int(rate))"
+        }
+        return "in=\(name(kAudioHardwarePropertyDefaultInputDevice)) out=\(name(kAudioHardwarePropertyDefaultOutputDevice))"
+    }
+
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func bump() { lock.lock(); n += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return n }
     }
 }
 #endif

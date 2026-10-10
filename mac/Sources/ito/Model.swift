@@ -96,6 +96,7 @@ final class AppModel: ObservableObject, LinkDelegate {
         link.delegate = self
         link.manualHost = manualHost.isEmpty ? nil : manualHost
         audio.onFrame = { [weak link] frame in link?.sendAudio(frame) }
+        audio.onError = { [weak self] error in self?.notice = "call audio: \(error.localizedDescription)" }
         notifier.model = self
         if identity.phone == nil { section = .phone }
         rebuild()
@@ -391,7 +392,7 @@ final class AppModel: ObservableObject, LinkDelegate {
         CallAudio.requestMic { [weak self] ok in
             guard let self else { return }
             guard ok else { self.notice = "ito needs the microphone for calls (system settings → privacy → microphone)"; return }
-            do { try self.audio.start() } catch { self.notice = "audio failed: \(error.localizedDescription)" }
+            self.audio.start()
         }
     }
 

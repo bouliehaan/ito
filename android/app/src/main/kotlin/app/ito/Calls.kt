@@ -180,6 +180,7 @@ class Calls(private val bridge: Bridge) {
             session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", result.problem))
             return
         }
+        if (result.problem == null) Log.i("ito-calls", "call audio up both ways for $id")
         result.problem?.let {
             Log.w("ito-calls", "call audio is one-way: $it")
             session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", "you can hear them, they can't hear you ($it)"))
