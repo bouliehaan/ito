@@ -45,6 +45,10 @@ class SmsSender(private val ctx: Context) {
 
 class SentReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
+        runCatching { handle(ctx, intent) }.onFailure { android.util.Log.w("ito", "sent receipt failed", it) }
+    }
+
+    private fun handle(ctx: Context, intent: Intent) {
         val bridge = (ctx.applicationContext as ItoApp).bridge
         val tag = SendTag(
             cid = intent.getStringExtra("cid"),
@@ -87,7 +91,7 @@ class SmsReceiver : BroadcastReceiver() {
         val sentAt = msgs[0].timestampMillis
         val app = ctx.applicationContext as ItoApp
         val pending = goAsync()
-        app.bridge.io.execute {
+        app.bridge.bg {
             try {
                 app.bridge.onInbound(from, body, sentAt)
             } finally {

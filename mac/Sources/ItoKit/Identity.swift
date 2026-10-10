@@ -14,7 +14,7 @@ public final class Identity {
     private var memory: [String: Data]?
 
     /// `inMemory` is for tests: nothing touches the Keychain.
-    public init(service: String = "app.ito", inMemory: Bool = false) {
+    public init(service: String = "app.ito.mac", inMemory: Bool = false) {
         self.service = service
         memory = inMemory ? [:] : nil
     }

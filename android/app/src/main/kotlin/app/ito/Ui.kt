@@ -57,7 +57,12 @@ object Ui {
     fun row(ctx: Context, key: String, value: String, valueColor: Int = TEXT) = LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
         setPadding(0, dp(ctx, 7f), 0, dp(ctx, 7f))
-        addView(label(ctx, key).apply { minWidth = dp(ctx, 92f); gravity = Gravity.CENTER_VERTICAL })
+        // Wide enough for "WI-FI CALLING" in tracked caps, plus a gap before the value.
+        addView(label(ctx, key).apply {
+            minWidth = dp(ctx, 150f)
+            setPadding(0, 0, dp(ctx, 12f), 0)
+            gravity = Gravity.CENTER_VERTICAL
+        })
         addView(text(ctx, value, 16f, valueColor), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
     }
 

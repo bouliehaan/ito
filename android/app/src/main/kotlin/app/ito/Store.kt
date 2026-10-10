@@ -30,13 +30,13 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
 
     fun smsAfter(after: Long, limit: Int): List<JSONObject> =
         query(Telephony.Sms.CONTENT_URI, smsCols, "${Telephony.Sms._ID} > ?", arrayOf(after.toString()),
-            "${Telephony.Sms._ID} ASC LIMIT $limit", ::smsRow)
+            "${Telephony.Sms._ID} ASC", limit, ::smsRow)
 
     fun smsRecent(count: Int): List<JSONObject> =
-        query(Telephony.Sms.CONTENT_URI, smsCols, null, null, "${Telephony.Sms._ID} DESC LIMIT $count", ::smsRow).reversed()
+        query(Telephony.Sms.CONTENT_URI, smsCols, null, null, "${Telephony.Sms._ID} DESC", count, ::smsRow).reversed()
 
     fun smsById(id: Long): JSONObject? =
-        query(Telephony.Sms.CONTENT_URI, smsCols, "${Telephony.Sms._ID} = ?", arrayOf(id.toString()), null, ::smsRow).firstOrNull()
+        query(Telephony.Sms.CONTENT_URI, smsCols, "${Telephony.Sms._ID} = ?", arrayOf(id.toString()), null, row = ::smsRow).firstOrNull()
 
     fun smsIds(): LongArray = ids(Telephony.Sms.CONTENT_URI)
 
@@ -44,7 +44,7 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
     fun ourRecentSent(sinceMs: Long): List<JSONObject> =
         query(Telephony.Sms.CONTENT_URI, smsCols,
             "${Telephony.Sms.CREATOR} = ? AND ${Telephony.Sms.DATE} > ? AND ${Telephony.Sms.TYPE} != ${Telephony.Sms.MESSAGE_TYPE_INBOX}",
-            arrayOf(pkg, sinceMs.toString()), "${Telephony.Sms._ID} ASC", ::smsRow)
+            arrayOf(pkg, sinceMs.toString()), "${Telephony.Sms._ID} ASC", row = ::smsRow)
 
     private fun smsRow(c: Cursor): JSONObject {
         val id = c.getLong(0)
@@ -71,10 +71,10 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
 
     fun mmsAfter(after: Long, limit: Int): List<JSONObject> =
         query(Telephony.Mms.CONTENT_URI, MMS_COLS, "${Telephony.Mms._ID} > ?", arrayOf(after.toString()),
-            "${Telephony.Mms._ID} ASC LIMIT $limit", ::mmsRow)
+            "${Telephony.Mms._ID} ASC", limit, ::mmsRow)
 
     fun mmsRecent(count: Int): List<JSONObject> =
-        query(Telephony.Mms.CONTENT_URI, MMS_COLS, null, null, "${Telephony.Mms._ID} DESC LIMIT $count", ::mmsRow).reversed()
+        query(Telephony.Mms.CONTENT_URI, MMS_COLS, null, null, "${Telephony.Mms._ID} DESC", count, ::mmsRow).reversed()
 
     fun mmsIds(): LongArray = ids(Telephony.Mms.CONTENT_URI)
 
@@ -123,9 +123,14 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
     fun callsAfter(after: Long, limit: Int): List<JSONObject> =
         query(CallLog.Calls.CONTENT_URI,
             arrayOf(CallLog.Calls._ID, CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
-            "${CallLog.Calls._ID} > ?", arrayOf(after.toString()), "${CallLog.Calls._ID} ASC LIMIT $limit") { c ->
+            "${CallLog.Calls._ID} > ?", arrayOf(after.toString()), "${CallLog.Calls._ID} ASC", limit = limit) { c ->
             JSONObject().put("id", c.getLong(0)).put("n", c.getString(1) ?: "").put("nm", c.getString(2) ?: "")
                 .put("ty", c.getInt(3)).put("d", c.getLong(4)).put("dur", c.getLong(5))
+        }
+
+    fun callsRecent(count: Int): List<JSONObject> =
+        query(CallLog.Calls.CONTENT_URI, arrayOf(CallLog.Calls._ID), null, null, "${CallLog.Calls._ID} DESC", limit = count) { c ->
+            JSONObject().put("id", c.getLong(0))
         }
 
     // --- Contacts ------------------------------------------------------------
@@ -174,11 +179,19 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
         return out.toLongArray()
     }
 
+    /**
+     * [limit] stops reading the cursor; it is never put in the SQL. Android 16's
+     * call-log provider rejects "LIMIT" in a sort order outright ("Invalid token
+     * LIMIT"), and the others are not promised to accept it either.
+     */
     private fun <T> query(
-        uri: Uri, cols: Array<String>, sel: String?, args: Array<String>?, order: String?, row: (Cursor) -> T?,
+        uri: Uri, cols: Array<String>, sel: String?, args: Array<String>?, order: String?,
+        limit: Int = Int.MAX_VALUE, row: (Cursor) -> T?,
     ): List<T> {
         val out = ArrayList<T>()
-        cr.query(uri, cols, sel, args, order)?.use { c -> while (c.moveToNext()) row(c)?.let(out::add) }
+        cr.query(uri, cols, sel, args, order)?.use { c ->
+            while (out.size < limit && c.moveToNext()) row(c)?.let(out::add)
+        }
         return out
     }
 

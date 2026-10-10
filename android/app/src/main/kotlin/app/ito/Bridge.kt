@@ -43,7 +43,10 @@ import java.util.concurrent.Executors
  */
 class Bridge(val ctx: Context) : PhoneHost {
     val keys = Keys(ctx)
-    val io = Executors.newSingleThreadExecutor { r -> Thread(r, "ito-io").apply { isDaemon = true } }
+    private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "ito-io").apply { isDaemon = true } }
+
+    /** Background work that can never take the bridge down: an uncaught throw on a pool thread kills the process. */
+    fun bg(block: () -> Unit) = io.execute { runCatching(block).onFailure { Log.w(TAG, "background task failed", it) } }
     private val sender = SmsSender(ctx)
     val groups = GroupEngine(File(ctx.filesDir, "groups.json"), { to, body, tag -> sendSms(to, body, tag) }, ::label)
     val store = Store(ctx.contentResolver, groups, ctx.packageName)
@@ -78,10 +81,10 @@ class Bridge(val ctx: Context) : PhoneHost {
     @Synchronized fun start() {
         if (started) return
         started = true
-        io.execute {
+        bg {
             lastSms = store.smsIds().lastOrNull() ?: 0
             lastMms = store.mmsIds().lastOrNull() ?: 0
-            lastCall = store.callsAfter(0, Int.MAX_VALUE).lastOrNull()?.getLong("id") ?: 0
+            lastCall = store.callsRecent(1).lastOrNull()?.getLong("id") ?: 0
         }
         try {
             link.start()

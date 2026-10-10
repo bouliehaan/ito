@@ -24,8 +24,8 @@ struct RootView: View {
                 PhoneView()
             }
         }
-        .ignoresSafeArea(.container, edges: .top)
-        .background(Theme.bg)
+        // Content stays below the hidden title bar; only the colours run up under it.
+        .background(Theme.bg.ignoresSafeArea())
         .foregroundStyle(Theme.text)
         .overlay(alignment: .bottom) { NoticeBar() }
         .preferredColorScheme(.dark)
@@ -69,10 +69,10 @@ struct Rail: View {
             }
         }
         .padding(.horizontal, 22)
-        .padding(.top, 34)
+        .padding(.top, 12)
         .padding(.bottom, 22)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Theme.elevated)
+        .background(Theme.elevated.ignoresSafeArea())
     }
 
     private var linkText: String {

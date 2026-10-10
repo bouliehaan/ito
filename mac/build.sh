@@ -1,13 +1,13 @@
 #!/bin/bash
 # Builds mac/build/ito.app. No Xcode project: SwiftPM compiles, this assembles
-# the bundle (Info.plist, fonts, icon) and signs it ad hoc.
+# the bundle (Info.plist, fonts, icon) and signs it.
 #
 #   ./build.sh            release build
 #   ./build.sh debug      debug build (enables the ITO_SNAPSHOT dev hook)
 #
-# Ad hoc signing means macOS asks again for the microphone and the Keychain
-# after every rebuild (the signature is the identity). Set ITO_SIGN to a
-# codesigning identity name to sign with a real certificate instead.
+# Signing: with the local identity from tools/signing.sh (~/.ito-signing) the app
+# keeps one identity across rebuilds, so macOS does not re-ask for the Keychain,
+# microphone and local network each time. Without it, ad hoc. ITO_SIGN overrides.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -45,6 +45,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign "${ITO_SIGN:--}" "$APP"
+KC="$HOME/.ito-signing/ito-signing.keychain-db"
+if [ -n "${ITO_SIGN:-}" ]; then
+  codesign --force --sign "$ITO_SIGN" "$APP"
+elif [ -f "$KC" ]; then
+  security unlock-keychain -p "$(cat "$HOME/.ito-signing/keychain.pass")" "$KC"
+  codesign --force --keychain "$KC" --sign "ito local signing" "$APP"
+else
+  codesign --force --sign - "$APP"
+fi
 codesign --verify --strict "$APP"
 echo "built $APP ($CONFIG)"
