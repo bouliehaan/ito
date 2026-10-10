@@ -4,6 +4,7 @@
 # That is what unlocks the call half of ito:
 #   CONTROL_INCALL_EXPERIENCE   see and control every call (non-UI in-call service)
 #   CALL_AUDIO_INTERCEPTION     the call's audio, both directions, over the link
+#   MODIFY_PHONE_STATE          required by audio policy for the uplink (TELEPHONY_TX) track
 #   READ_PRECISE_PHONE_STATE    whether Wi-Fi Calling is registered
 #   START_*_FROM_BACKGROUND     go microphone-foreground for a call while in a drawer
 #
@@ -14,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PRIVILEGED="CONTROL_INCALL_EXPERIENCE CALL_AUDIO_INTERCEPTION READ_PRECISE_PHONE_STATE START_ACTIVITIES_FROM_BACKGROUND START_FOREGROUND_SERVICES_FROM_BACKGROUND"
+PRIVILEGED="CONTROL_INCALL_EXPERIENCE CALL_AUDIO_INTERCEPTION MODIFY_PHONE_STATE READ_PRECISE_PHONE_STATE START_ACTIVITIES_FROM_BACKGROUND START_FOREGROUND_SERVICES_FROM_BACKGROUND"
 ORDINARY="INTERNET ACCESS_NETWORK_STATE ACCESS_WIFI_STATE CHANGE_NETWORK_STATE WAKE_LOCK FOREGROUND_SERVICE FOREGROUND_SERVICE_CONNECTED_DEVICE FOREGROUND_SERVICE_MICROPHONE RECEIVE_BOOT_COMPLETED POST_NOTIFICATIONS READ_SMS RECEIVE_SMS SEND_SMS RECEIVE_MMS READ_CONTACTS READ_CALL_LOG READ_PHONE_STATE READ_PHONE_NUMBERS CALL_PHONE ANSWER_PHONE_CALLS RECORD_AUDIO MODIFY_AUDIO_SETTINGS"
 
 [ -f keystore/keystore.properties ] || tools/keystore.sh
@@ -46,6 +47,14 @@ rm -rf "$OUT"
 mkdir -p "$STAGE/system/priv-app/ito" "$STAGE/system/etc/permissions" "$STAGE/system/etc/sysconfig"
 cp -R magisk/template/META-INF "$STAGE/"
 cp "$APK" "$STAGE/system/priv-app/ito/ito.apk"
+# Android reuses its parsed copy of a system app while the app's DIRECTORY looks older
+# than the cache, and Magisk mounts that directory with a 1970 timestamp. Without this,
+# a module update keeps running the previous APK forever. Drop ito's entry each boot.
+cat > "$STAGE/post-fs-data.sh" <<'SH'
+#!/system/bin/sh
+rm -f /data/system/package_cache/*/ito-*
+SH
+chmod 755 "$STAGE/post-fs-data.sh"
 cat > "$STAGE/module.prop" <<PROP
 id=ito
 name=ito

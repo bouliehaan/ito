@@ -38,6 +38,9 @@
     <uses-permission android:name="android.permission.CONTROL_INCALL_EXPERIENCE" />
     <!-- The call audio itself: downlink out, uplink in (AudioManager call redirection). -->
     <uses-permission android:name="android.permission.CALL_AUDIO_INTERCEPTION" />
+    <!-- Audio policy also demands this for any track into the uplink (TELEPHONY_TX):
+         without it the injection track is refused, "modify phone state not allowed". -->
+    <uses-permission android:name="android.permission.MODIFY_PHONE_STATE" />
     <!-- IMS registration state (is Wi-Fi Calling up?) for the Mac's status line. -->
     <uses-permission android:name="android.permission.READ_PRECISE_PHONE_STATE" />
     <!-- Lets the bridge, which lives in the background, go microphone-foreground for a call. -->

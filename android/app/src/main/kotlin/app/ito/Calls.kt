@@ -167,18 +167,22 @@ class Calls(private val bridge: Bridge) {
         if (!calls.containsKey(id)) return
         if (audioCall != null && audioCall != id) stopAudio()
         bridge.service?.promoteForCall(true)
-        val err = audio.start { frame -> session.sendAudio(frame) }
-        if (err != null) {
+        val result = audio.start { frame -> session.sendAudio(frame) }
+        if (!result.started) {
             // Telecom can report the call before it has switched the audio mode to
             // "in call", and the redirection API refuses until it has. Give it a moment.
             if (attempt < 8) {
                 main.postDelayed({ startAudio(id, session, attempt + 1) }, 250)
                 return
             }
-            Log.w("ito-calls", "call audio failed: $err")
+            Log.w("ito-calls", "call audio failed: ${result.problem}")
             bridge.service?.promoteForCall(false)
-            session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", err))
+            session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", result.problem))
             return
+        }
+        result.problem?.let {
+            Log.w("ito-calls", "call audio is one-way: $it")
+            session.post(JSONObject().put("t", "error").put("for", "audio").put("msg", "you can hear them, they can't hear you ($it)"))
         }
         audioOwner = session
         audioCall = id

@@ -46,10 +46,16 @@ class CallAudio(private val ctx: Context) {
             .getOrNull()
     }
 
-    /** Starts both directions. Returns an error string, or null on success. */
-    @Synchronized fun start(sink: (ByteArray) -> Unit): String? {
-        if (running) return null
-        if (!permitted) return "call audio needs the system install (android/magisk)"
+    /**
+     * [started] = the downlink runs (the Mac hears the call). [problem] = what was refused:
+     * with started=false nothing runs (worth retrying while Telecom switches the audio
+     * mode); with started=true only the uplink failed, so the Mac can hear but not be heard.
+     */
+    data class Start(val started: Boolean, val problem: String?)
+
+    @Synchronized fun start(sink: (ByteArray) -> Unit): Start {
+        if (running) return Start(true, null)
+        if (!permitted) return Start(false, "call audio needs the system install (android/magisk)")
         val inFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
         val outFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -57,20 +63,24 @@ class CallAudio(private val ctx: Context) {
         val rec = try {
             am.javaClass.getMethod("getCallDownlinkExtractionAudioRecord", AudioFormat::class.java).invoke(am, inFmt) as AudioRecord
         } catch (e: Exception) {
-            return "downlink: ${rootMessage(e)}"
+            return Start(false, "downlink: ${rootMessage(e)}")
         }
+        // The uplink needs MODIFY_PHONE_STATE on top of CALL_AUDIO_INTERCEPTION (audio
+        // policy's TELEPHONY_TX check). If it is refused anyway, keep the downlink:
+        // hearing the call beats silence, and the Mac says why it cannot be heard.
+        var uplinkProblem: String? = null
         val trk = try {
             am.javaClass.getMethod("getCallUplinkInjectionAudioTrack", AudioFormat::class.java).invoke(am, outFmt) as AudioTrack
         } catch (e: Exception) {
-            rec.release()
-            return "uplink: ${rootMessage(e)}"
+            uplinkProblem = "uplink: ${rootMessage(e)}"
+            null
         }
         record = rec
         track = trk
         inbox.clear()
         running = true
         rec.startRecording()
-        trk.play()
+        trk?.play()
 
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -88,6 +98,8 @@ class CallAudio(private val ctx: Context) {
             }
         }, "ito-downlink").start()
 
+        if (trk == null) return Start(true, uplinkProblem)
+
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val silence = ByteArray(FRAME_BYTES)
@@ -98,7 +110,7 @@ class CallAudio(private val ctx: Context) {
                 trk.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
             }
         }, "ito-uplink").start()
-        return null
+        return Start(true, null)
     }
 
     /** A frame of Mac microphone. Latency beats completeness: past ~120 ms of backlog, drop the oldest. */
