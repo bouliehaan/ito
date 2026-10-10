@@ -101,7 +101,15 @@ final class AppModel: ObservableObject, LinkDelegate {
         }
         audio.onError = { [weak self] error in self?.notice = "call audio: \(error.localizedDescription)" }
         notifier.model = self
-        if identity.phone == nil { section = .phone }
+        // The first Keychain read can wait on a password prompt after an update: do it off
+        // the main thread so the window opens regardless. Views read `paired`.
+        DispatchQueue.global(qos: .userInitiated).async { [identity] in
+            let p = identity.phone
+            DispatchQueue.main.async {
+                self.paired = p
+                if p == nil { self.section = .phone }
+            }
+        }
         rebuild()
         link.start()
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
@@ -116,9 +124,17 @@ final class AppModel: ObservableObject, LinkDelegate {
     // MARK: LinkDelegate
 
     func linkStateChanged(_ state: LinkClient.State) {
-        let wasPaired = identity.phone != nil
+        let wasPaired = paired != nil
+        // Any state change comes after the link has read the Keychain, so this is a cache hit.
+        paired = identity.phone
+        let wasLinked = linked
         linkState = state
+        if wasLinked && !linked { unreachableSince = Date() }
         if case .linked = state {
+            unreachableSince = nil
+            // What the Mac already had: anything newer, unread, arrived while it was away.
+            // Zero means a first import of the whole history, which never notifies.
+            caughtUpFrom = store.maxSms > 0 ? (store.maxSms, store.maxCall) : nil
             syncing = true
             // Notify only for what arrives after this sync, never for history.
             notifyAfterSms = .max
@@ -157,6 +173,7 @@ final class AppModel: ObservableObject, LinkDelegate {
             phone.charging = m["charging"] as? Bool ?? false
             phone.wifi = m["wifi"] as? Bool ?? false
             phone.ims = m["ims"] as? String ?? "unknown"
+            watchDrawer()
         case "sms":
             let rows = m["rows"] as? [[String: Any]] ?? []
             store.upsertSms(rows)
@@ -217,6 +234,7 @@ final class AppModel: ObservableObject, LinkDelegate {
             syncing = false
             notifyAfterSms = store.maxSms
             notifyAfterCall = store.maxCall
+            announceCatchUp()
         case "error":
             notice = (m["msg"] as? String) ?? "the phone could not do that"
         default:
@@ -246,6 +264,58 @@ final class AppModel: ObservableObject, LinkDelegate {
     func thread(_ key: String) -> ThreadSummary? { threads.first { $0.id == key } }
 
     func displayName(_ number: String) -> String { store.name(for: number) ?? Numbers.pretty(number) }
+
+    // MARK: while the Mac was away
+
+    @Published var unreachableSince: Date?
+    /// The paired phone, mirrored from the Keychain for the views (never read it per render).
+    @Published var paired: Identity.Phone?
+    private var caughtUpFrom: (sms: Int64, calls: Int64)?
+
+    /// Texts and missed calls that came in while the link was down arrive with the catch-up
+    /// sync, which never notifies (so history can't spam). Say so once instead.
+    private func announceCatchUp() {
+        guard let from = caughtUpFrom else { return }
+        caughtUpFrom = nil
+        let texts = store.sms.values.filter { $0.id > from.sms && $0.incoming && $0.r == 0 && !$0.rl }.sorted { $0.d < $1.d }
+        if texts.count > 3 {
+            let who = Array(Set(texts.map { displayName($0.a) })).sorted().prefix(4).joined(separator: ", ")
+            notifier.alert(title: "\(texts.count) texts while ito was away", body: who)
+        } else {
+            for s in texts {
+                notifier.text(title: displayName(s.a), body: s.b, thread: s.g.map { "g:" + $0 } ?? "t:\(s.th)")
+            }
+        }
+        for c in store.calls.values where c.id > from.calls && c.missed {
+            notifier.missedCall(from: c.nm.isEmpty ? displayName(c.n) : c.nm)
+        }
+    }
+
+    // MARK: the phone in the drawer
+
+    private var warnedBattery = false
+    private var imsDownSince: Date?
+    private var warnedIms = false
+
+    /// Only real drawer failures: a phone running flat off its charger, or Wi-Fi Calling
+    /// gone (texts and calls stop working). Unplugging it to take it out is not one of them.
+    private func watchDrawer() {
+        if phone.plugged { warnedBattery = false }
+        if !phone.plugged, let b = phone.battery, b <= 20, !warnedBattery {
+            warnedBattery = true
+            notifier.alert(title: "phone battery \(b)%", body: "it isn't charging. check the cable in the drawer.")
+        }
+        if phone.ims == "wifi" || phone.ims == "cellular" || phone.ims == "registering" {
+            imsDownSince = nil
+            warnedIms = false
+        } else if phone.ims != "unknown" {
+            if imsDownSince == nil { imsDownSince = Date() }
+            if !warnedIms, let since = imsDownSince, Date().timeIntervalSince(since) > 180 {
+                warnedIms = true
+                notifier.alert(title: "wi-fi calling is down on the phone", body: "texts and calls may not go through until it comes back.")
+            }
+        }
+    }
 
     private func markSelectedRead() {
         guard NSApp?.isActive == true, section == .messages, let key = selected, let last = messages(key).last else { return }
@@ -374,6 +444,13 @@ final class AppModel: ObservableObject, LinkDelegate {
     @Published var dialed = ""
     @Published var callKeypad = false
 
+    /// Hand the call back to the phone: the Mac lets go, the phone gets its mic and volume back.
+    func moveCallToPhone() {
+        guard let c = call else { return }
+        wantAudio = nil
+        link.send(["t": "audio", "id": c.id, "on": false])
+    }
+
     /// Pull a call that was answered on the phone itself over to this Mac.
     func takeCallHere() {
         guard let c = call else { return }
@@ -439,6 +516,7 @@ final class AppModel: ObservableObject, LinkDelegate {
     // MARK: pairing
 
     func forgetPhone() {
+        paired = nil
         link.forgetPhone()
         store.wipe()
         phone = PhoneInfo()

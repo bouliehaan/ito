@@ -28,6 +28,8 @@ class CallMonitor : InCallService() {
 
     override fun onCallAdded(call: Call) = calls.onAdded(this, call)
     override fun onCallRemoved(call: Call) = calls.onRemoved(call)
+    @Deprecated("CallAudioState is how Telecom still reports the route to an in-call service")
+    override fun onCallAudioStateChanged(state: android.telecom.CallAudioState) = calls.onRouteChanged(state.route)
     override fun onUnbind(intent: android.content.Intent?): Boolean {
         calls.onUnbound(this)
         return super.onUnbind(intent)
@@ -171,7 +173,8 @@ class Calls(private val bridge: Bridge) {
     private val main = Handler(Looper.getMainLooper())
     private val dtmf = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ito-dtmf").apply { isDaemon = true } }
     private val am get() = bridge.ctx.getSystemService(android.media.AudioManager::class.java)
-    private var savedVoiceVolume: Int? = null
+    private val prefs get() = bridge.ctx.getSharedPreferences("calls", android.content.Context.MODE_PRIVATE)
+    private var quietSince = 0L
 
     /**
      * While a Mac carries the call, the phone in the drawer should be inert: the in-call
@@ -183,14 +186,40 @@ class Calls(private val bridge: Bridge) {
         val stream = android.media.AudioManager.STREAM_VOICE_CALL
         runCatching {
             if (on) {
-                if (savedVoiceVolume == null) savedVoiceVolume = am.getStreamVolume(stream)
+                // On disk, not in memory: if ito dies mid-call, the next start puts it back.
+                if (!prefs.contains(SAVED_VOLUME)) prefs.edit().putInt(SAVED_VOLUME, am.getStreamVolume(stream)).commit()
+                quietSince = System.currentTimeMillis()
                 service?.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
                 am.setStreamVolume(stream, am.getStreamMinVolume(stream), 0)
             } else {
-                savedVoiceVolume?.let { am.setStreamVolume(stream, it, 0) }
-                savedVoiceVolume = null
+                restoreVolume()
             }
         }.onFailure { Log.w("ito-calls", "could not quiet the phone: $it") }
+    }
+
+    /** Also called at every start: undo a quieting that a crash or restart left behind. */
+    fun restoreVolume() {
+        if (!prefs.contains(SAVED_VOLUME) || audioCall != null) return
+        runCatching { am.setStreamVolume(android.media.AudioManager.STREAM_VOICE_CALL, prefs.getInt(SAVED_VOLUME, 0), 0) }
+        prefs.edit().remove(SAVED_VOLUME).commit()
+    }
+
+    /**
+     * Someone picked up the phone: the call's route changed on the phone itself (speaker,
+     * a headset, Bluetooth) while a Mac carried it. The phone always wins; hand it back.
+     */
+    fun onRouteChanged(route: Int) {
+        if (audioCall == null || route == android.telecom.CallAudioState.ROUTE_EARPIECE) return
+        if (System.currentTimeMillis() - quietSince < 1500) return // our own switch settling
+        Log.i("ito-calls", "route changed on the phone ($route): call goes back to the phone")
+        releaseToPhone()
+    }
+
+    /** The phone takes the call back from the Mac: audio stops, volume and mic return. */
+    fun releaseToPhone() {
+        val owner = audioOwner
+        stopAudio()
+        owner?.post(JSONObject().put("t", "error").put("for", "audio").put("msg", "the call moved to the phone"))
     }
 
     private fun startAudio(id: String, session: PhoneLink.Session, attempt: Int = 0) {
@@ -223,10 +252,10 @@ class Calls(private val bridge: Bridge) {
 
     private fun stopAudio() {
         audio.stop()
-        quietPhone(false)
         val id = audioCall
         audioOwner = null
         audioCall = null
+        quietPhone(false) // after audioCall is cleared: restoreVolume refuses during a Mac call
         bridge.service?.promoteForCall(false)
         id?.let { calls[it] }?.let { bridge.link.broadcast(stateJson(id, it)) }
     }
@@ -264,6 +293,10 @@ class Calls(private val bridge: Bridge) {
 
     @Suppress("MissingPermission")
     private fun legacyEnd() = runCatching { telecom.endCall() }
+
+    private companion object {
+        const val SAVED_VOLUME = "voiceVolumeBeforeMac"
+    }
 
     private fun stateName(s: Int) = when (s) {
         Call.STATE_RINGING, Call.STATE_SIMULATED_RINGING -> "ringing"

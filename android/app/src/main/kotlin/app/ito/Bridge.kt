@@ -81,6 +81,8 @@ class Bridge(val ctx: Context) : PhoneHost {
     @Synchronized fun start() {
         if (started) return
         started = true
+        // A Mac call that ended in a crash may have left the call volume at minimum.
+        calls.restoreVolume()
         bg {
             lastSms = store.smsIds().lastOrNull() ?: 0
             lastMms = store.mmsIds().lastOrNull() ?: 0

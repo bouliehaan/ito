@@ -14,7 +14,7 @@ struct PhoneView: View {
                     Text(">").font(Theme.mono(18)).foregroundStyle(Theme.muted)
                     Text("SETTINGS").font(Theme.mono(16, bold: true)).tracking(1.8)
                 }
-                if model.identity.phone == nil || isPairing { pairing } else { phoneCard }
+                if model.paired == nil || isPairing { pairing } else { phoneCard }
                 linkSettings
             }
             .padding(32)
@@ -96,8 +96,12 @@ struct PhoneView: View {
         VStack(alignment: .leading, spacing: 14) {
             SectionHead("phone")
             Card {
-                Text(model.identity.phone?.name ?? "phone").font(Theme.mono(20, bold: true))
+                Text(model.paired?.name ?? "phone").font(Theme.mono(20, bold: true))
                 row("link", linkText)
+                if model.unreachableSince != nil {
+                    Text("can't reach the phone. that's normal if it's out with you. if it's in the drawer and restarted, unlock it once.")
+                        .font(Theme.mono(12)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+                }
                 if model.linked {
                     row("number", model.phone.number.isEmpty ? "unknown" : Numbers.pretty(model.phone.number))
                     row("android", "\(model.phone.android) · \(model.phone.model)")
@@ -109,7 +113,7 @@ struct PhoneView: View {
                     row("calls", model.phone.system ? "full control" : "ringing + decline (system install needed)", warn: !model.phone.system)
                     row("call audio", audioText, warn: model.phone.callAudio != "ok")
                 }
-                row("key", model.identity.phone?.fingerprint ?? "")
+                row("key", model.paired?.fingerprint ?? "")
             }
             HStack {
                 Button(confirmForget ? "really forget it" : "forget this phone") {

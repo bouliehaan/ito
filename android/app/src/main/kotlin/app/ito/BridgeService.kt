@@ -34,7 +34,10 @@ class BridgeService : Service() {
         refresh()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_USE_PHONE) bridge.calls.releaseToPhone()
+        return START_STICKY
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -81,17 +84,24 @@ class BridgeService : Service() {
             else -> "waiting for your mac"
         }
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, CHANNEL)
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_launcher_fg)
             .setContentTitle("ito")
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
-            .build()
+        if (inCall) {
+            // Picking up the phone always works: one tap takes the call off the Mac.
+            val use = PendingIntent.getService(this, 1, Intent(this, BridgeService::class.java).setAction(ACTION_USE_PHONE),
+                PendingIntent.FLAG_IMMUTABLE)
+            b.addAction(Notification.Action.Builder(null, "use phone", use).build())
+        }
+        return b.build()
     }
 
     companion object {
         private const val CHANNEL = "link"
+        private const val ACTION_USE_PHONE = "app.ito.USE_PHONE"
 
         fun start(ctx: Context) = ctx.startForegroundService(Intent(ctx, BridgeService::class.java))
     }

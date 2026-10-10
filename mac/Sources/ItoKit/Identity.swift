@@ -26,12 +26,29 @@ public final class Identity {
         return key
     }()
 
+    /// Read from the Keychain once, then served from memory: a Keychain read is a round
+    /// trip to securityd, and the first one after an app update can sit behind a password
+    /// prompt. Thread-safe; only the very first read can block.
     public var phone: Phone? {
-        get { read("phone").flatMap { try? JSONDecoder().decode(Phone.self, from: $0) } }
+        get {
+            lock.lock(); defer { lock.unlock() }
+            if !phoneLoaded {
+                cachedPhone = read("phone").flatMap { try? JSONDecoder().decode(Phone.self, from: $0) }
+                phoneLoaded = true
+            }
+            return cachedPhone
+        }
         set {
+            lock.lock(); defer { lock.unlock() }
             if let newValue, let data = try? JSONEncoder().encode(newValue) { write("phone", data) } else { delete("phone") }
+            cachedPhone = newValue
+            phoneLoaded = true
         }
     }
+
+    private let lock = NSLock()
+    private var cachedPhone: Phone?
+    private var phoneLoaded = false
 
     // MARK: Keychain
 

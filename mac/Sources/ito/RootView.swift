@@ -66,6 +66,11 @@ struct CallBar: View {
                         if c.audio {
                             Button(model.callMuted ? "unmute" : "mute") { model.callMuted.toggle() }
                                 .buttonStyle(ConsoleButton(kind: model.callMuted ? .primary : .ghost, compact: true))
+                            Button("move to phone") { model.moveCallToPhone() }
+                                .buttonStyle(ConsoleButton(kind: .ghost, compact: true))
+                        } else if c.state == "active", c.full, model.phone.callAudio == "ok" {
+                            Button("take it here") { model.takeCallHere() }
+                                .buttonStyle(ConsoleButton(kind: .primary, compact: true))
                         }
                         if c.full {
                             Button("keypad") { model.callKeypad.toggle() }
@@ -116,7 +121,7 @@ struct Rail: View {
                 SectionHead("phone").padding(.bottom, 8)
                 nav(.messages, "01", "messages", badge: model.unreadTotal)
                 nav(.calls, "02", "calls", badge: 0)
-                nav(.phone, "03", "settings", badge: model.identity.phone == nil ? 1 : 0)
+                nav(.phone, "03", "settings", badge: model.paired == nil ? 1 : 0)
             }
             .padding(.top, 34)
 
@@ -124,7 +129,7 @@ struct Rail: View {
             if model.syncing {
                 Caps("syncing…", color: Theme.dim, size: 11).padding(.bottom, 8)
             }
-            if let p = model.identity.phone {
+            if let p = model.paired {
                 Text(p.name).font(Theme.mono(12)).foregroundStyle(Theme.muted).lineLimit(1)
             }
         }
@@ -136,6 +141,13 @@ struct Rail: View {
     }
 
     private var linkText: String {
+        // Not an error: the phone may simply be out with you.
+        if model.unreachableSince != nil, model.paired != nil {
+            switch model.linkState {
+            case .searching, .failed: return "phone away"
+            default: break
+            }
+        }
         switch model.linkState {
         case .unpaired: return "not paired"
         case .searching: return "looking…"

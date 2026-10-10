@@ -45,6 +45,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post("call", c)
     }
 
+    func alert(title: String, body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        post("alert-\(UUID().uuidString)", c)
+    }
+
     func missedCall(from who: String) {
         let c = UNMutableNotificationContent()
         c.title = who
