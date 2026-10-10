@@ -17,8 +17,12 @@ nothing here: it plays to the `afe-proxy-playback` route, which this ROM's mixer
 do not have, so the caller heard the phone's own mic instead.
 
 What works is Qualcomm's **in-call music** (`incall_music_uplink`, built for music on
-hold): it mixes a playback stream into the call and mutes the phone's mic while it
-plays. Audio policy hands it to a track that is routed explicitly to the Telephony Tx
+hold): it mixes a playback stream into the call. It does **not** mute the phone's mic by
+itself (an early version of this doc said it did, and calls carried the phone's mic
+underneath). What it does is change what a call mute means: while it plays, a mute cuts
+the mic device only (`voice_set_device_mute_flag`, "use_device_mute" in the HAL log)
+instead of the whole uplink. So ito mutes the call once in-call music is running, and
+unmutes before handing the call back. Muting before it runs would silence the Mac too. Audio policy hands it to a track that is routed explicitly to the Telephony Tx
 device (`setPreferredDevice(TYPE_TELEPHONY)`, usage `VOICE_COMMUNICATION`), but on the
 V60 three things stood in the way. The Magisk module fixes all three:
 
@@ -45,13 +49,18 @@ Proof in the HAL log: `adev_open_output_stream: Stream picks up usecase (incall_
   outgoing call is dialing and the line is silent.
 - **Keypad tones.** Each digit is held 160 ms and sent one at a time; back-to-back
   play/stop is too short for IMS. The Mac plays the tone locally too.
-- **The phone while a Mac has the call.** It's held on the earpiece at minimum volume
-  (restored afterwards, even after a crash); in-call music mutes its mic. Tapping
+- **The phone while a Mac has the call.** It's held on the earpiece at minimum volume and
+  its mic is muted (both restored afterwards, even after a crash). If the Mac's mic stops
+  arriving, the phone says so and the Mac shows it. Tapping
   "use phone" on ito's notification, or switching the route on the phone, hands the
   call back.
 
 ## the Mac side
 
 Apple's voice processing (echo cancellation) when the devices allow it. A Bluetooth
-headset in call mode can refuse it (-10875); then the plain engine runs (no echo to
-cancel in headphones), remembered per device so the next call starts instantly.
+headset in call mode can refuse it (-10875), and so can a USB interface paired with
+Bluetooth output; then the plain engine runs, remembered per input device so the next
+call starts instantly. Every call and every fallback gets a new AVAudioEngine: one that
+had voice processing switched on and off again keeps playing but its mic delivers nothing.
+A watchdog rebuilds if no mic frames arrive within 1.5 s. Logs: `/usr/bin/log show --info
+--predicate 'subsystem == "app.ito"'` (categories `link` and `audio`).
