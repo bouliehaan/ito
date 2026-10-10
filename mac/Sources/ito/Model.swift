@@ -363,7 +363,16 @@ final class AppModel: ObservableObject, LinkDelegate {
     func decline() { if let c = call { link.send(["t": "decline", "id": c.id]) } }
     func hangup() { if let c = call { link.send(["t": "hangup", "id": c.id]) } }
     func hold(_ on: Bool) { if let c = call { link.send(["t": "hold", "id": c.id, "on": on]) } }
-    func dtmf(_ d: String) { if let c = call { link.send(["t": "dtmf", "id": c.id, "d": d]) } }
+    func dtmf(_ d: String) {
+        guard let c = call, c.state == "active" || c.state == "dialing", let key = d.first, "0123456789*#".contains(key) else { return }
+        audio.tone(key)
+        dialed += String(key)
+        link.send(["t": "dtmf", "id": c.id, "d": String(key)])
+    }
+
+    /// Keys pressed during this call, shown under the keypad.
+    @Published var dialed = ""
+    @Published var callKeypad = false
 
     /// Pull a call that was answered on the phone itself over to this Mac.
     func takeCallHere() {
@@ -381,6 +390,7 @@ final class AppModel: ObservableObject, LinkDelegate {
 
         if info.state == "ended" {
             if call?.id == info.id || call == nil {
+                audio.ringback = false
                 stopAudio()
                 notifier.clearCall()
                 call = info
@@ -392,7 +402,13 @@ final class AppModel: ObservableObject, LinkDelegate {
             return
         }
         let wasRinging = call?.id == info.id && call?.state == "ringing"
+        if call?.id != info.id {
+            dialed = ""
+            callKeypad = false
+        }
         call = info
+        // Outgoing and not yet answered: the Mac plays the ringback the phone would have.
+        audio.ringback = info.dir == "out" && info.state == "dialing"
         if info.state == "ringing" && !wasRinging { notifier.ringing(from: info.title) }
         if info.state != "ringing" { notifier.clearCall() }
         if info.audio && wantAudio == info.id { startAudio() } else if !info.audio { stopAudio() }

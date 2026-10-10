@@ -136,12 +136,19 @@ public final class CallAudio {
         guard backlog < 8, let buf = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: 320) else { return }
         buf.frameLength = 320
         let dst = buf.floatChannelData![0]
+        var peak: Float = 0
         frame.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for i in 0..<320 {
                 let v = Int16(bitPattern: UInt16(raw[4 + 2 * i]) | UInt16(raw[5 + 2 * i]) << 8)
                 dst[i] = Float(v) / 32768
+                peak = max(peak, abs(dst[i]))
             }
         }
+        // Real sound on the line (early media, an announcement, the person) always wins
+        // over the made-up ringback, for the rest of the call.
+        if peak > 0.02 { lineHasSound = true }
+        if ringback && !lineHasSound { synthRingback(dst) }
+        if toneLeft > 0 { mixTone(dst) }
         lock.lock(); queued += 1; lock.unlock()
         let scheduled = ITOCatch({
             self.player.scheduleBuffer(buf) { [weak self] in
@@ -150,6 +157,60 @@ public final class CallAudio {
             }
         }, nil)
         if !scheduled { lock.lock(); queued -= 1; lock.unlock() }
+    }
+
+    // MARK: tones the phone would have played locally
+
+    /// The phone generates ringback itself when the network sends none (Telecom's
+    /// RingbackPlayer), so it never travels the call audio. Set while an outgoing call
+    /// is dialing; it only sounds while the line itself is silent.
+    public var ringback = false {
+        didSet { if ringback && !oldValue { ringFrame = 0; lineHasSound = false } }
+    }
+    private var lineHasSound = false
+    private var ringFrame = 0
+    private var ringPhase = (0.0, 0.0)
+
+    /// US ringback: 440 + 480 Hz, 2 s on, 4 s off. 50 frames a second.
+    private func synthRingback(_ dst: UnsafeMutablePointer<Float>) {
+        let on = ringFrame % 300 < 100
+        ringFrame += 1
+        for i in 0..<320 {
+            var v: Float = 0
+            if on {
+                v = Float(sin(ringPhase.0) + sin(ringPhase.1)) * 0.09
+                ringPhase.0 += 2 * .pi * 440 / 16_000
+                ringPhase.1 += 2 * .pi * 480 / 16_000
+            }
+            dst[i] = v
+        }
+        if !on { ringPhase = (0, 0) }
+    }
+
+    private var toneFreqs = (0.0, 0.0)
+    private var tonePhase = (0.0, 0.0)
+    private var toneLeft = 0
+
+    /// Keypad feedback, so a pressed key sounds like one. 160 ms, matching what the phone sends.
+    public func tone(_ key: Character) {
+        let rows: [Character: Double] = ["1": 697, "2": 697, "3": 697, "4": 770, "5": 770, "6": 770,
+                                         "7": 852, "8": 852, "9": 852, "*": 941, "0": 941, "#": 941]
+        let cols: [Character: Double] = ["1": 1209, "4": 1209, "7": 1209, "*": 1209,
+                                         "2": 1336, "5": 1336, "8": 1336, "0": 1336,
+                                         "3": 1477, "6": 1477, "9": 1477, "#": 1477]
+        guard let r = rows[key], let c = cols[key] else { return }
+        toneFreqs = (r, c)
+        tonePhase = (0, 0)
+        toneLeft = 8
+    }
+
+    private func mixTone(_ dst: UnsafeMutablePointer<Float>) {
+        toneLeft -= 1
+        for i in 0..<320 {
+            dst[i] += Float(sin(tonePhase.0) + sin(tonePhase.1)) * 0.08
+            tonePhase.0 += 2 * .pi * toneFreqs.0 / 16_000
+            tonePhase.1 += 2 * .pi * toneFreqs.1 / 16_000
+        }
     }
 
     // MARK: graph

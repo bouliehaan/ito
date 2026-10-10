@@ -5,16 +5,37 @@ import SwiftUI
 
 /// A small floating window for the live call, above everything, on every
 /// Space. Rings (a looped system sound) while the phone rings.
+/// Takes keyboard digits straight to DTMF while the call panel is focused.
+final class CallNSPanel: NSPanel {
+    var onKey: ((String) -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if let s = event.charactersIgnoringModifiers, s.count == 1, "0123456789*#".contains(s) { onKey?(s) } else { super.keyDown(with: event) }
+    }
+}
+
 @MainActor
 final class CallPanelController {
-    private var panel: NSPanel?
+    private var panel: CallNSPanel?
     private var cancel: AnyCancellable?
+    private var keypadCancel: AnyCancellable?
     private var ring: Timer?
     private let model: AppModel
 
     init(model: AppModel) {
         self.model = model
         cancel = model.$call.receive(on: RunLoop.main).sink { [weak self] call in self?.update(call) }
+        keypadCancel = model.$callKeypad.receive(on: RunLoop.main).sink { [weak self] on in self?.resize(keypad: on) }
+    }
+
+    /// Grow downward for the keypad, keeping the top edge where the user put it.
+    private func resize(keypad: Bool) {
+        guard let p = panel else { return }
+        var f = p.frame
+        let h: CGFloat = keypad ? 560 : 278
+        f.origin.y += f.height - h
+        f.size.height = h
+        p.setFrame(f, display: true, animate: false)
     }
 
     private func update(_ call: CallInfo?) {
@@ -24,9 +45,10 @@ final class CallPanelController {
             return
         }
         if panel == nil {
-            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 250),
-                            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
+            let p = CallNSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 250),
+                                styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
+            p.onKey = { [weak model] k in model?.dtmf(k) }
             p.titleVisibility = .hidden
             p.titlebarAppearsTransparent = true
             p.isMovableByWindowBackground = true
@@ -57,7 +79,6 @@ final class CallPanelController {
 
 struct CallPanelView: View {
     @EnvironmentObject var model: AppModel
-    @State private var keypad = false
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
@@ -74,8 +95,11 @@ struct CallPanelView: View {
                     }
                     Text(c.title).font(Theme.mono(22, bold: true)).lineLimit(1)
                     if !c.name.isEmpty { Text(Numbers.pretty(c.number)).font(Theme.mono(13)).foregroundStyle(Theme.muted) }
-                    if keypad && c.state == "active" {
-                        Keypad { model.dtmf($0) }.scaleEffect(0.7).frame(height: 170)
+                    if model.callKeypad && (c.state == "active" || c.state == "dialing") {
+                        Text(model.dialed.isEmpty ? "type or click digits" : model.dialed)
+                            .font(Theme.mono(model.dialed.isEmpty ? 12 : 18)).foregroundStyle(model.dialed.isEmpty ? Theme.muted : Theme.text)
+                            .lineLimit(1).truncationMode(.head)
+                        Keypad { model.dtmf($0) }
                     }
                     Spacer(minLength: 0)
                     controls(c)
@@ -123,7 +147,8 @@ struct CallPanelView: View {
                     Button("take it here") { model.takeCallHere() }.buttonStyle(ConsoleButton(kind: .primary, compact: true))
                 }
                 if c.full {
-                    Button("keys") { keypad.toggle() }.buttonStyle(ConsoleButton(kind: keypad ? .primary : .ghost, compact: true))
+                    Button("keypad") { model.callKeypad.toggle() }
+                        .buttonStyle(ConsoleButton(kind: model.callKeypad ? .primary : .ghost, compact: true))
                     Button(c.state == "held" ? "resume" : "hold") { model.hold(c.state != "held") }
                         .buttonStyle(ConsoleButton(kind: .ghost, compact: true))
                 }

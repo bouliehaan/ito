@@ -59,7 +59,9 @@ class CallAudio(private val ctx: Context) {
     @Synchronized fun start(sink: (ByteArray) -> Unit): Start {
         if (running) return Start(true, null)
         if (!permitted) return Start(false, "call audio needs the system install (android/magisk)")
+        lastProblem = null
         val (rec, downVia) = openDownlink() ?: return Start(false, lastProblem ?: "downlink refused")
+        lastProblem = null
         val opened = openUplink()
         val trk = opened?.first
         val uplinkProblem = if (trk == null) (lastProblem ?: "uplink refused") else null
@@ -127,12 +129,17 @@ class CallAudio(private val ctx: Context) {
         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
 
     /**
-     * The other person. First choice: plain VOICE_DOWNLINK capture, the Qualcomm
-     * call-recording path ("incall-rec-downlink"), which leaves the call where it is.
-     * The redirection API also works on this phone but moves the whole call onto the
-     * AFE proxy, and the routing flaps between that and the earpiece.
+     * The other person. First choice: the redirection API's downlink record, proven on
+     * the V60 (Qualcomm's "incall-rec-downlink" path, the call stays on the earpiece).
+     * Fallback: plain VOICE_DOWNLINK capture, the same HAL path by the older door.
      */
     private fun openDownlink(): Pair<AudioRecord, String>? {
+        try {
+            return (am.javaClass.getMethod("getCallDownlinkExtractionAudioRecord", AudioFormat::class.java).invoke(am, inFmt) as AudioRecord) to "call redirection"
+        } catch (e: Exception) {
+            lastProblem = "downlink: ${rootMessage(e)}"
+            Log.i(TAG, "redirection downlink refused, trying voice-downlink capture: $lastProblem")
+        }
         try {
             @Suppress("MissingPermission")
             val r = AudioRecord.Builder()
@@ -142,16 +149,11 @@ class CallAudio(private val ctx: Context) {
                 .build()
             if (r.state == AudioRecord.STATE_INITIALIZED) return r to "call recording (voice downlink)"
             r.release()
-            lastProblem = "downlink: voice-downlink capture did not initialise"
+            lastProblem = (lastProblem?.let { "$it; " } ?: "") + "voice-downlink capture did not initialise"
         } catch (e: Exception) {
-            lastProblem = "downlink: ${rootMessage(e)}"
+            lastProblem = (lastProblem?.let { "$it; " } ?: "") + "voice-downlink: ${rootMessage(e)}"
         }
-        return try {
-            (am.javaClass.getMethod("getCallDownlinkExtractionAudioRecord", AudioFormat::class.java).invoke(am, inFmt) as AudioRecord) to "call redirection"
-        } catch (e: Exception) {
-            lastProblem = "downlink: ${rootMessage(e)}"
-            null
-        }
+        return null
     }
 
     /**

@@ -140,10 +140,17 @@ class Calls(private val bridge: Bridge) {
             }
             "decline" -> if (call != null) call.reject(false, null) else legacyEnd()
             "hangup" -> if (call != null) call.disconnect() else legacyEnd()
-            "dtmf" -> call?.let {
+            "dtmf" -> call?.let { c ->
                 val digit = m.getString("d").first()
-                it.playDtmfTone(digit)
-                it.stopDtmfTone()
+                // Held 160 ms, one at a time. A play immediately followed by stop is too short
+                // for IMS to send a DTMF event and the far end never sees the digit.
+                dtmf.execute {
+                    Log.i("ito-calls", "dtmf $digit")
+                    c.playDtmfTone(digit)
+                    Thread.sleep(160)
+                    c.stopDtmfTone()
+                    Thread.sleep(80)
+                }
             }
             "hold" -> call?.let { if (m.optBoolean("on")) it.hold() else it.unhold() }
             "audio" -> if (m.optBoolean("on")) {
@@ -162,6 +169,29 @@ class Calls(private val bridge: Bridge) {
     }
 
     private val main = Handler(Looper.getMainLooper())
+    private val dtmf = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ito-dtmf").apply { isDaemon = true } }
+    private val am get() = bridge.ctx.getSystemService(android.media.AudioManager::class.java)
+    private var savedVoiceVolume: Int? = null
+
+    /**
+     * While a Mac carries the call, the phone in the drawer should be inert: the in-call
+     * music route already mutes its mic, and this keeps the call on the earpiece (never
+     * the loudspeaker) at the lowest volume. The user's volume comes back afterwards.
+     */
+    @Suppress("DEPRECATION")
+    private fun quietPhone(on: Boolean) {
+        val stream = android.media.AudioManager.STREAM_VOICE_CALL
+        runCatching {
+            if (on) {
+                if (savedVoiceVolume == null) savedVoiceVolume = am.getStreamVolume(stream)
+                service?.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
+                am.setStreamVolume(stream, am.getStreamMinVolume(stream), 0)
+            } else {
+                savedVoiceVolume?.let { am.setStreamVolume(stream, it, 0) }
+                savedVoiceVolume = null
+            }
+        }.onFailure { Log.w("ito-calls", "could not quiet the phone: $it") }
+    }
 
     private fun startAudio(id: String, session: PhoneLink.Session, attempt: Int = 0) {
         if (!calls.containsKey(id)) return
@@ -187,11 +217,13 @@ class Calls(private val bridge: Bridge) {
         }
         audioOwner = session
         audioCall = id
+        quietPhone(true)
         calls[id]?.let { bridge.link.broadcast(stateJson(id, it)) }
     }
 
     private fun stopAudio() {
         audio.stop()
+        quietPhone(false)
         val id = audioCall
         audioOwner = null
         audioCall = null
