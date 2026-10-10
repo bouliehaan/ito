@@ -13,9 +13,11 @@ rm -rf "$DIST"; mkdir -p "$DIST"
 (cd "$ROOT/android" && ./gradlew -q :link:test && magisk/build.sh)
 cp "$ROOT/android/magisk/out/ito-magisk.zip" "$DIST/ito-magisk-$VERSION.zip"
 
-(cd "$ROOT/mac" && swift test >/dev/null && ./build.sh release)
+# Never with a personal Apple Development cert: its name and email would ship in the DMG.
+(cd "$ROOT/mac" && swift test >/dev/null && ITO_PUBLIC=1 ./build.sh release)
 APP="$ROOT/mac/build/ito.app"
 codesign --verify --deep --strict "$APP"
+if codesign -dvv "$APP" 2>&1 | grep -q '^Authority=Apple Development'; then echo "refusing: personal cert on a public build" >&2; exit 1; fi
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/ito.app"
 ln -s /Applications "$STAGE/Applications"

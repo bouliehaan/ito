@@ -5,9 +5,15 @@
 #   ./build.sh            release build
 #   ./build.sh debug      debug build (enables the ITO_SNAPSHOT dev hook)
 #
-# Signing: with the local identity from tools/signing.sh (~/.ito-signing) the app
-# keeps one identity across rebuilds, so macOS does not re-ask for the Keychain,
-# microphone and local network each time. Without it, ad hoc. ITO_SIGN overrides.
+# Signing, first that exists:
+#   ITO_SIGN="<identity>"      that one
+#   an Apple Development cert   from Xcode (free Apple account). It has a Team ID, so the
+#                               Keychain and microphone remember ito across rebuilds and
+#                               updates stop asking for the password. It names its owner,
+#                               so builds for other people (ITO_PUBLIC=1, tools/dist.sh)
+#                               never use it.
+#   the local identity          from tools/signing.sh (~/.ito-signing), anonymous
+#   ad hoc
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -51,8 +57,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 KC="$HOME/.ito-signing/ito-signing.keychain-db"
+DEV=""
+[ -z "${ITO_PUBLIC:-}" ] && DEV="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development: /{ print $2; exit }')"
 if [ -n "${ITO_SIGN:-}" ]; then
   codesign --force --sign "$ITO_SIGN" "$APP"
+elif [ -n "$DEV" ]; then
+  codesign --force --sign "$DEV" "$APP"
 elif [ -f "$KC" ]; then
   security unlock-keychain -p "$(cat "$HOME/.ito-signing/keychain.pass")" "$KC"
   codesign --force --keychain "$KC" --sign "ito local signing" "$APP"

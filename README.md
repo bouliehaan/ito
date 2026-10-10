@@ -94,8 +94,10 @@ phone.
 - **MMS is read-only.** Old picture messages and MMS groups show up; new ones can't
   download without mobile data, and ito says so in the thread. An old MMS group has a
   one-click "make it an ito group".
-- The Mac app is signed ad hoc, so macOS asks again for the microphone and Keychain after
-  each rebuild. `ITO_SIGN="<identity>" mac/build.sh` signs with a real certificate.
+- **Signing the Mac app yourself.** Sign in to Xcode with an Apple account (free is fine) and add
+  an Apple Development certificate. `mac/build.sh` then uses it, and macOS stops asking for your
+  password (Keychain) and the microphone after every rebuild. Without one the build falls back to
+  a local self-signed identity (`tools/signing.sh`), which asks again after each rebuild.
 
 ## license
 
