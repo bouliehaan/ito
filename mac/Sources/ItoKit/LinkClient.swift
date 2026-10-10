@@ -1,5 +1,8 @@
 import Foundation
 import Network
+import os
+
+private let log = Logger(subsystem: "app.ito", category: "link")
 
 /// Always called on the main queue.
 @MainActor
@@ -14,6 +17,10 @@ public protocol LinkDelegate: AnyObject {
 /// initiator, pairs (numeric comparison) or checks the pinned key, then keeps
 /// the session alive and reconnects when it drops. Everything runs on one
 /// serial queue; the delegate hears about it on the main queue.
+///
+/// The rule that keeps it from ever getting stuck: every connection attempt ends
+/// within `attemptTimeout`, linked or failed, and every failure schedules the next
+/// attempt. A network change or the Mac waking up skips the wait.
 public final class LinkClient {
     public enum State: Equatable {
         case unpaired
@@ -65,10 +72,44 @@ public final class LinkClient {
     private var backoff: TimeInterval = 1
     private var stopped = true
 
+    private var monitor: NWPathMonitor?
+    private var lastPath = ""
+    private var localNetworkDenied = false
+    private var attempts = 0
+    private var viaLastAddress = false
+
+    /// Long enough for a slow Wi-Fi handshake, short enough that a stall is noticed.
+    var attemptTimeout: TimeInterval = 10
+    static let localNetworkHelp = "macOS is blocking ito from the local network. System Settings → Privacy & Security → Local Network → turn ito on."
+
+    /// Where the phone last answered (IPv4, or IPv6 with its interface), tried when Bonjour
+    /// can't see it: some networks, and some phones with the screen off, drop multicast.
+    private var lastAddress: NWEndpoint? {
+        get {
+            let d = UserDefaults.standard
+            guard let host = d.string(forKey: "ito.lastHost"), let port = NWEndpoint.Port(rawValue: UInt16(clamping: d.integer(forKey: "ito.lastPort"))),
+                  port.rawValue != 0 else { return nil }
+            return .hostPort(host: NWEndpoint.Host(host), port: port)
+        }
+        set {
+            let d = UserDefaults.standard
+            if case let .hostPort(host, port)? = newValue {
+                d.set("\(host)", forKey: "ito.lastHost")
+                d.set(Int(port.rawValue), forKey: "ito.lastPort")
+            } else {
+                d.removeObject(forKey: "ito.lastHost")
+                d.removeObject(forKey: "ito.lastPort")
+            }
+        }
+    }
+
     public private(set) var state: State = .unpaired {
         didSet {
             let s = state
-            if s != oldValue { DispatchQueue.main.async { self.delegate?.linkStateChanged(s) } }
+            if s != oldValue {
+                log.info("state: \(String(describing: s), privacy: .public)")
+                DispatchQueue.main.async { self.delegate?.linkStateChanged(s) }
+            }
         }
     }
 
@@ -82,7 +123,20 @@ public final class LinkClient {
         queue.async {
             self.stopped = false
             self.browse()
+            self.watchNetwork()
             self.kick()
+        }
+    }
+
+    public func stop() {
+        queue.async {
+            self.stopped = true
+            self.retry?.cancel()
+            self.drop()
+            self.browser?.cancel()
+            self.browser = nil
+            self.monitor?.cancel()
+            self.monitor = nil
         }
     }
 
@@ -130,11 +184,10 @@ public final class LinkClient {
         }
     }
 
+    /// The Mac woke up, the network changed, or the user asked: find out now whether the
+    /// link is alive instead of waiting out a ping or a backoff.
     public func reconnectNow() {
-        queue.async {
-            self.backoff = 1
-            if !self.trusted { self.drop(); self.kick() }
-        }
+        queue.async { self.checkNow() }
     }
 
     public func send(_ message: [String: Any]) {
@@ -168,26 +221,100 @@ public final class LinkClient {
             DispatchQueue.main.async { self.delegate?.linkFound(list) }
             self.kick()
         }
-        b.stateUpdateHandler = { _ in }
+        b.stateUpdateHandler = { [weak self, weak b] st in
+            guard let self, let b, b === self.browser else { return }
+            switch st {
+            case .ready:
+                self.localNetworkDenied = false
+            case .waiting(let e):
+                log.error("browse waiting: \(String(describing: e), privacy: .public)")
+                self.localNetworkDenied = Self.policyDenied(e)
+                if self.localNetworkDenied, !self.trusted, self.conn == nil { self.state = .failed(Self.localNetworkHelp) }
+            case .failed(let e):
+                // A dead browser would never report the phone again: start a fresh one.
+                log.error("browse failed: \(String(describing: e), privacy: .public)")
+                self.restartBrowse(after: 2)
+            default:
+                break
+            }
+        }
         b.start(queue: queue)
         browser = b
     }
 
+    private func restartBrowse(after delay: TimeInterval) {
+        browser?.cancel()
+        browser = nil
+        found = [:]
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.browse()
+        }
+    }
+
+    /// Wi-Fi rejoined, Ethernet plugged in, the Mac woke: a fresh look and a fresh attempt.
+    private func watchNetwork() {
+        guard monitor == nil else { return }
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let key = path.status == .satisfied ? path.availableInterfaces.map(\.name).sorted().joined(separator: ",") : "down"
+            guard key != self.lastPath else { return }
+            let first = self.lastPath.isEmpty
+            self.lastPath = key
+            guard !first, path.status == .satisfied else { return }
+            log.info("network changed: \(key, privacy: .public)")
+            self.restartBrowse(after: 0)
+            self.checkNow()
+        }
+        m.start(queue: queue)
+        monitor = m
+    }
+
+    private func checkNow() {
+        backoff = 1
+        if trusted {
+            let asked = Date()
+            sendNow(["t": "ping"])
+            queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.trusted, self.lastHeard < asked else { return }
+                self.fail("phone stopped answering")
+            }
+        } else if pairTarget == nil {
+            retry?.cancel()
+            drop()
+            kick()
+        }
+    }
+
+    static func policyDenied(_ e: NWError) -> Bool {
+        if case .dns(let code) = e { return code == -65570 }   // kDNSServiceErr_PolicyDenied
+        return false
+    }
+
     /// If we have a phone and no connection, go and get it.
     private func kick() {
-        guard !stopped, conn == nil, pairTarget == nil, let phone = identity.phone else {
-            if identity.phone == nil, pairTarget == nil, conn == nil { state = .unpaired }
+        guard !stopped, conn == nil, pairTarget == nil else { return }
+        guard let phone = identity.phone else {
+            state = identity.refused.map { .failed($0.description) } ?? .unpaired
             return
         }
+        attempts += 1
+        viaLastAddress = false
         if let host = manualHost, let ep = Self.endpoint(host) {
             connect(to: ep, label: host)
             return
         }
-        if let f = found.values.first(where: { $0.fingerprint == phone.fingerprint })
-            ?? found.values.first(where: { $0.fingerprint == nil }) {
-            connect(to: f.endpoint, label: phone.name)
+        let seen = found.values.first(where: { $0.fingerprint == phone.fingerprint })
+            ?? found.values.first(where: { $0.fingerprint == nil })
+        // Bonjour first. When it sees nothing, or on every other retry, the last address.
+        if let ep = lastAddress, seen == nil || attempts % 2 == 0 {
+            viaLastAddress = true
+            connect(to: ep, label: phone.name)
+        } else if let seen {
+            connect(to: seen.endpoint, label: phone.name)
         } else {
-            state = .searching
+            state = localNetworkDenied ? .failed(Self.localNetworkHelp) : .searching
         }
     }
 
@@ -213,21 +340,41 @@ public final class LinkClient {
         trusted = false
         transport = nil
         state = .connecting(label)
+        log.info("connecting: \(String(describing: endpoint), privacy: .public)")
         c.stateUpdateHandler = { [weak self, weak c] st in
             guard let self, let c, c === self.conn else { return }
             switch st {
             case .ready: self.handshake(c)
-            case .failed(let e): self.fail("connection failed: \(e.localizedDescription)")
-            case .waiting(let e): self.fail("phone unreachable: \(e.localizedDescription)")
+            case .failed(let e): self.fail(self.unreachable(c, e))
+            case .waiting(let e): self.fail(self.unreachable(c, e))
             case .cancelled: break
             default: break
             }
         }
         c.start(queue: queue)
+        // Network.framework can sit in .preparing forever without saying why (it did when
+        // macOS refused the first connection of a freshly updated build), and a phone can
+        // accept and then never answer. Either way this attempt ends here and the next one
+        // is scheduled. Comparing codes during pairing takes as long as it takes.
+        queue.asyncAfter(deadline: .now() + attemptTimeout) { [weak self, weak c] in
+            guard let self, let c, c === self.conn, !self.trusted else { return }
+            if case .pairing = self.state { return }
+            self.fail(self.unreachable(c, nil))
+        }
+    }
+
+    private func unreachable(_ c: NWConnection, _ e: NWError?) -> String {
+        if localNetworkDenied || c.currentPath?.unsatisfiedReason == .localNetworkDenied || e.map(Self.policyDenied) == true {
+            return Self.localNetworkHelp
+        }
+        if let e { return "phone unreachable: \(e.localizedDescription)" }
+        return "the phone didn't answer"
     }
 
     private func handshake(_ c: NWConnection) {
-        let h = XXHandshake(initiator: true, s: identity.staticKey)
+        let key: DhKey
+        do { key = try identity.staticKey() } catch { return fail("\(error)", retry: false) }
+        let h = XXHandshake(initiator: true, s: key)
         hs = h
         do {
             writeFrame(try h.writeMessage())
@@ -241,6 +388,12 @@ public final class LinkClient {
                 self.remoteStatic = rs
                 if let pinned = self.identity.phone {
                     guard pinned.key == rs else {
+                        // An ito phone with a different key now has the remembered address
+                        // (the router handed it out again): forget the address, keep looking.
+                        if self.viaLastAddress {
+                            self.lastAddress = nil
+                            return self.fail("the phone moved to a new address")
+                        }
                         // Somebody answered as our phone with a different key. Never talk to it.
                         return self.fail("refusing \(self.phoneName): its key does not match the paired phone. if you reinstalled ito on the phone, forget it here and pair again.", retry: false)
                     }
@@ -295,6 +448,8 @@ public final class LinkClient {
                 }
                 trusted = true
                 backoff = 1
+                attempts = 0
+                if case .hostPort? = conn?.currentPath?.remoteEndpoint { lastAddress = conn?.currentPath?.remoteEndpoint }
                 state = .linked(phone: phoneName)
                 startPing()
             case "pairing":
@@ -402,6 +557,7 @@ public final class LinkClient {
 
     private func fail(_ why: String, retry shouldRetry: Bool = true) {
         let wasPairing = pairTarget != nil
+        log.error("link failed: \(why, privacy: .public)")
         drop()
         state = .failed(why)
         // A failed pairing is over; the user starts a new one from the list.

@@ -116,5 +116,19 @@ final class InteropTests: XCTestCase, LinkDelegate {
         XCTAssertEqual(bubbles.count, 1)
         XCTAssertEqual(bubbles.first?.body, "dinner at 8?")
         XCTAssertEqual(bubbles.first?.recipients, 3)
+
+        // The fake phone never advertises on Bonjour, like a phone whose multicast is being
+        // dropped: a fresh start still finds it where it last answered.
+        defer { ["ito.lastHost", "ito.lastPort"].forEach(UserDefaults.standard.removeObject(forKey:)) }
+        XCTAssertNotNil(UserDefaults.standard.string(forKey: "ito.lastHost"), "linked, so the address is remembered")
+        link.stop()
+        let again = LinkClient(identity: identity)
+        again.delegate = self
+        let relinked = expectation(description: "relinked at the last address")
+        relinked.assertForOverFulfill = false
+        onState = { s in if case .linked = s { relinked.fulfill() } }
+        again.start()
+        wait(for: [relinked], timeout: 15)
+        again.stop()
     }
 }

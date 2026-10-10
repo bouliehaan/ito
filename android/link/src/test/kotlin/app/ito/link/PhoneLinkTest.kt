@@ -105,6 +105,19 @@ class PhoneLinkTest {
     }
 
     @Test
+    fun theSameMacComingBackReplacesItsDeadSession() {
+        val mac = Mac()
+        host.pinned += mac.key.pub
+        assertEquals("trusted", mac.connect(link.boundPort).getString("state"))
+        // It slept without closing anything, woke up and connected again.
+        val again = Mac(mac.key)
+        assertEquals("trusted", again.connect(link.boundPort).getString("state"))
+        val deadline = System.currentTimeMillis() + 5_000
+        while (link.trustedCount != 1 && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals("one Mac, not a ghost of it as well", 1, link.trustedCount)
+    }
+
+    @Test
     fun strangerIsRefusedWhenPairingIsClosed() {
         val mac = Mac()
         val auth = mac.connect(link.boundPort)

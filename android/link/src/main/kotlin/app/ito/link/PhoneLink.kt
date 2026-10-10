@@ -237,6 +237,10 @@ class PhoneLink(
         }
 
         private fun becomeTrusted() {
+            // The same Mac again (it slept, or its Wi-Fi blinked): its old session is dead but
+            // would otherwise linger until the 45 s idle timeout, counted as a second Mac.
+            sessions.filter { it !== this && it.trusted && it.ch.remoteStatic.contentEquals(ch.remoteStatic) }
+                .forEach { it.close() }
             trusted = true
             setReadTimeout(IDLE_TIMEOUT_MS)
             ch.sendJson(JSONObject().put("t", "auth").put("state", "trusted"))

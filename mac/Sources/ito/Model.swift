@@ -101,17 +101,24 @@ final class AppModel: ObservableObject, LinkDelegate {
         }
         audio.onError = { [weak self] error in self?.notice = "call audio: \(error.localizedDescription)" }
         notifier.model = self
-        // The first Keychain read can wait on a password prompt after an update: do it off
+        // The first Keychain reads can wait on a password prompt after an update: do them off
         // the main thread so the window opens regardless. Views read `paired`.
         DispatchQueue.global(qos: .userInitiated).async { [identity] in
+            identity.preload()
             let p = identity.phone
+            let refused = identity.refused
             DispatchQueue.main.async {
                 self.paired = p
+                if let refused { self.notice = refused.description }
                 if p == nil { self.section = .phone }
             }
         }
         rebuild()
         link.start()
+        // After sleep the old connection is usually dead; check now rather than at the next ping.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.link.reconnectNow() }
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.markSelectedRead() }
         }
@@ -125,8 +132,8 @@ final class AppModel: ObservableObject, LinkDelegate {
 
     func linkStateChanged(_ state: LinkClient.State) {
         let wasPaired = paired != nil
-        // Any state change comes after the link has read the Keychain, so this is a cache hit.
-        paired = identity.phone
+        // Never a Keychain read here: this is the main thread, and a read can wait on a prompt.
+        paired = identity.knownPhone
         let wasLinked = linked
         linkState = state
         if wasLinked && !linked { unreachableSince = Date() }

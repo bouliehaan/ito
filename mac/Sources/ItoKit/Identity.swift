@@ -3,11 +3,19 @@ import Security
 
 /// The Mac's Noise key and the one phone it trusts, both in the login Keychain.
 /// The private key never touches a file.
-public final class Identity {
+/// Thread-safe: every mutable field sits behind a lock.
+public final class Identity: @unchecked Sendable {
     public struct Phone: Codable, Equatable {
         public var key: Data
         public var name: String
         public var fingerprint: String { Sas.fingerprint(key) }
+    }
+
+    public struct KeychainRefused: Error, CustomStringConvertible {
+        public let status: OSStatus
+        public var description: String {
+            "the Keychain didn't hand over ito's keys (\(status)). quit and reopen ito, enter your Mac password and choose Always Allow."
+        }
     }
 
     private let service: String
@@ -19,38 +27,93 @@ public final class Identity {
         memory = inMemory ? [:] : nil
     }
 
-    public lazy var staticKey: DhKey = {
-        if let raw = read("mac-static"), let key = try? DhKey(privData: raw) { return key }
-        let key = DhKey()
-        write("mac-static", key.privData)
+    /// Set when the Keychain refused a read: the password prompt was denied, or could not
+    /// be shown. Cleared by the next read that works.
+    public var refused: KeychainRefused? {
+        lock.lock(); defer { lock.unlock() }
+        return lastRefusal
+    }
+
+    /// The phone as last read, without touching the Keychain, so it never waits behind a
+    /// password prompt. Safe on the main thread.
+    public var knownPhone: Phone? {
+        lock.lock(); defer { lock.unlock() }
+        return cachedPhone
+    }
+
+    /// Both reads up front, so the password prompts after an update come together at launch
+    /// rather than one now and one at the first handshake.
+    public func preload() {
+        _ = phone
+        _ = try? staticKey()
+    }
+
+    /// The Mac's Noise key, made on the very first run. A Keychain that refuses to answer is
+    /// an error, never a reason to make a new key: that would silently unpair this Mac.
+    public func staticKey() throws -> DhKey {
+        reading.lock(); defer { reading.unlock() }
+        if let key = cached({ cachedKey }) { return key }
+        let key: DhKey
+        switch read("mac-static") {
+        case .found(let raw):
+            key = try DhKey(privData: raw)
+        case .missing:
+            key = DhKey()
+            write("mac-static", key.privData)
+        case .refused(let status):
+            throw KeychainRefused(status: status)
+        }
+        cached { cachedKey = key }
         return key
-    }()
+    }
 
     /// Read from the Keychain once, then served from memory: a Keychain read is a round
     /// trip to securityd, and the first one after an app update can sit behind a password
-    /// prompt. Thread-safe; only the very first read can block.
+    /// prompt. A refused read is not remembered, so the next access asks again.
     public var phone: Phone? {
         get {
-            lock.lock(); defer { lock.unlock() }
-            if !phoneLoaded {
-                cachedPhone = read("phone").flatMap { try? JSONDecoder().decode(Phone.self, from: $0) }
-                phoneLoaded = true
+            reading.lock(); defer { reading.unlock() }
+            if cached({ phoneLoaded }) { return knownPhone }
+            switch read("phone") {
+            case .found(let data):
+                let p = try? JSONDecoder().decode(Phone.self, from: data)
+                cached { cachedPhone = p; phoneLoaded = true }
+                return p
+            case .missing:
+                cached { cachedPhone = nil; phoneLoaded = true }
+                return nil
+            case .refused:
+                return nil
             }
-            return cachedPhone
         }
         set {
-            lock.lock(); defer { lock.unlock() }
+            reading.lock(); defer { reading.unlock() }
             if let newValue, let data = try? JSONEncoder().encode(newValue) { write("phone", data) } else { delete("phone") }
-            cachedPhone = newValue
-            phoneLoaded = true
+            cached { cachedPhone = newValue; phoneLoaded = true }
         }
     }
 
+    /// One Keychain call at a time; may be held across a password prompt.
+    private let reading = NSLock()
+    /// The values below; never held across a Keychain call.
     private let lock = NSLock()
     private var cachedPhone: Phone?
     private var phoneLoaded = false
+    private var cachedKey: DhKey?
+    private var lastRefusal: KeychainRefused?
+
+    private func cached<T>(_ body: () -> T) -> T {
+        lock.lock(); defer { lock.unlock() }
+        return body()
+    }
 
     // MARK: Keychain
+
+    private enum Read {
+        case found(Data)
+        case missing
+        case refused(OSStatus)
+    }
 
     private func base(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -58,13 +121,25 @@ public final class Identity {
          kSecAttrAccount as String: account]
     }
 
-    private func read(_ account: String) -> Data? {
-        if let memory { return memory[account] }
+    /// Called with `reading` held.
+    private func read(_ account: String) -> Read {
+        if let memory { return memory[account].map(Read.found) ?? .missing }
         var q = base(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
-        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        switch status {
+        case errSecSuccess where out is Data:
+            cached { lastRefusal = nil }
+            return .found(out as! Data)
+        case errSecItemNotFound:
+            cached { lastRefusal = nil }
+            return .missing
+        default:
+            cached { lastRefusal = KeychainRefused(status: status) }
+            return .refused(status)
+        }
     }
 
     private func write(_ account: String, _ data: Data) {
