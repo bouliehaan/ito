@@ -2,10 +2,13 @@ package app.ito
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.os.Process
 import android.util.Log
 import java.nio.ByteBuffer
@@ -56,28 +59,15 @@ class CallAudio(private val ctx: Context) {
     @Synchronized fun start(sink: (ByteArray) -> Unit): Start {
         if (running) return Start(true, null)
         if (!permitted) return Start(false, "call audio needs the system install (android/magisk)")
-        val inFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
-        val outFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
-        val rec = try {
-            am.javaClass.getMethod("getCallDownlinkExtractionAudioRecord", AudioFormat::class.java).invoke(am, inFmt) as AudioRecord
-        } catch (e: Exception) {
-            return Start(false, "downlink: ${rootMessage(e)}")
-        }
-        // The uplink needs MODIFY_PHONE_STATE on top of CALL_AUDIO_INTERCEPTION (audio
-        // policy's TELEPHONY_TX check). If it is refused anyway, keep the downlink:
-        // hearing the call beats silence, and the Mac says why it cannot be heard.
-        var uplinkProblem: String? = null
-        val trk = try {
-            am.javaClass.getMethod("getCallUplinkInjectionAudioTrack", AudioFormat::class.java).invoke(am, outFmt) as AudioTrack
-        } catch (e: Exception) {
-            uplinkProblem = "uplink: ${rootMessage(e)}"
-            null
-        }
+        val (rec, downVia) = openDownlink() ?: return Start(false, lastProblem ?: "downlink refused")
+        val opened = openUplink()
+        val trk = opened?.first
+        val uplinkProblem = if (trk == null) (lastProblem ?: "uplink refused") else null
+        Log.i(TAG, "call audio: downlink via $downVia, uplink via ${opened?.second ?: "nothing ($uplinkProblem)"}")
         record = rec
         track = trk
         inbox.clear()
+        downFrames = 0; downPeak = 0; upFrames = 0; upPeak = 0; upStarved = 0
         running = true
         rec.startRecording()
         trk?.play()
@@ -86,6 +76,7 @@ class CallAudio(private val ctx: Context) {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             var seq = 0
             val pcm = ByteArray(FRAME_BYTES)
+            var lastReport = System.currentTimeMillis()
             while (running) {
                 var got = 0
                 while (got < FRAME_BYTES && running) {
@@ -94,7 +85,16 @@ class CallAudio(private val ctx: Context) {
                     got += n
                 }
                 if (got < FRAME_BYTES) continue
+                downFrames++
+                downPeak = maxOf(downPeak, peak(pcm))
                 sink(ByteBuffer.allocate(4 + FRAME_BYTES).putInt(seq++).put(pcm).array())
+                val now = System.currentTimeMillis()
+                if (now - lastReport >= 5000) {
+                    // Levels, not just counts: a path can deliver frames of perfect silence.
+                    Log.i(TAG, "call audio: down $downFrames frames peak $downPeak · up $upFrames frames peak $upPeak, $upStarved silent fills")
+                    downPeak = 0; upPeak = 0
+                    lastReport = now
+                }
             }
         }, "ito-downlink").start()
 
@@ -107,10 +107,110 @@ class CallAudio(private val ctx: Context) {
                 // Keep the uplink fed: silence when the Mac is late, never a gap.
                 val f = inbox.poll(40, TimeUnit.MILLISECONDS)
                 val pcm = if (f != null && f.size == 4 + FRAME_BYTES) f.copyOfRange(4, f.size) else silence
+                if (pcm === silence) upStarved++ else { upFrames++; upPeak = maxOf(upPeak, peak(pcm)) }
                 trk.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
             }
         }, "ito-uplink").start()
         return Start(true, null)
+    }
+
+    @Volatile private var lastProblem: String? = null
+    @Volatile private var downFrames = 0L
+    @Volatile private var downPeak = 0
+    @Volatile private var upFrames = 0L
+    @Volatile private var upPeak = 0
+    @Volatile private var upStarved = 0L
+
+    private val inFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+        .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
+    private val outFmt = AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
+
+    /**
+     * The other person. First choice: plain VOICE_DOWNLINK capture, the Qualcomm
+     * call-recording path ("incall-rec-downlink"), which leaves the call where it is.
+     * The redirection API also works on this phone but moves the whole call onto the
+     * AFE proxy, and the routing flaps between that and the earpiece.
+     */
+    private fun openDownlink(): Pair<AudioRecord, String>? {
+        try {
+            @Suppress("MissingPermission")
+            val r = AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_DOWNLINK)
+                .setAudioFormat(inFmt)
+                .setBufferSizeInBytes(maxOf(AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT), FRAME_BYTES * 8))
+                .build()
+            if (r.state == AudioRecord.STATE_INITIALIZED) return r to "call recording (voice downlink)"
+            r.release()
+            lastProblem = "downlink: voice-downlink capture did not initialise"
+        } catch (e: Exception) {
+            lastProblem = "downlink: ${rootMessage(e)}"
+        }
+        return try {
+            (am.javaClass.getMethod("getCallDownlinkExtractionAudioRecord", AudioFormat::class.java).invoke(am, inFmt) as AudioRecord) to "call redirection"
+        } catch (e: Exception) {
+            lastProblem = "downlink: ${rootMessage(e)}"
+            null
+        }
+    }
+
+    /**
+     * You. First choice: Qualcomm's in-call music ("incall_music_uplink"), which mixes a
+     * playback stream into the uplink and mutes the phone's own mic while it plays. Audio
+     * policy only selects it for a track routed explicitly to the Telephony Tx device, and
+     * on the V60 that needs two things the Magisk module supplies: the HAL feature
+     * property and an incall_music → Telephony Tx route in the policy file.
+     * Fallback: the redirection API's injection track (its "afe-proxy-playback" route
+     * does not exist on this ROM, so it opens but carries nothing).
+     */
+    private fun openUplink(): Pair<AudioTrack, String>? {
+        val tx = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+        if (tx != null) {
+            try {
+                val t = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                    .setAudioFormat(outFmt)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT), FRAME_BYTES * 6))
+                    .build()
+                t.setPreferredDevice(tx)
+                // A track re-routes when it starts, so start it and push one frame of silence
+                // before asking where it went. Never let the Mac's voice come out of the
+                // phone's speaker instead: keep it only if it landed on the telephony device.
+                if (t.state == AudioTrack.STATE_INITIALIZED) {
+                    t.play()
+                    t.write(ByteArray(FRAME_BYTES), 0, FRAME_BYTES, AudioTrack.WRITE_BLOCKING)
+                    if (t.routedDevice?.type == AudioDeviceInfo.TYPE_TELEPHONY) return t to "in-call music"
+                    lastProblem = "uplink: in-call music not routed (went to ${t.routedDevice?.type ?: "nothing"})"
+                    runCatching { t.stop() }
+                }
+                t.release()
+            } catch (e: Exception) {
+                lastProblem = "uplink: ${rootMessage(e)}"
+            }
+        } else {
+            lastProblem = "uplink: no telephony output device"
+        }
+        return try {
+            (am.javaClass.getMethod("getCallUplinkInjectionAudioTrack", AudioFormat::class.java).invoke(am, outFmt) as AudioTrack) to "call redirection"
+        } catch (e: Exception) {
+            lastProblem = (lastProblem?.let { "$it; " } ?: "") + "redirection: ${rootMessage(e)}"
+            null
+        }
+    }
+
+    private fun peak(pcm: ByteArray): Int {
+        var p = 0
+        var i = 0
+        while (i < pcm.size - 1) {
+            val v = (pcm[i].toInt() and 0xff) or (pcm[i + 1].toInt() shl 8)
+            val a = kotlin.math.abs(v.toShort().toInt())
+            if (a > p) p = a
+            i += 2
+        }
+        return p
     }
 
     /** A frame of Mac microphone. Latency beats completeness: past ~120 ms of backlog, drop the oldest. */

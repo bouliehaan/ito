@@ -95,7 +95,10 @@ final class AppModel: ObservableObject, LinkDelegate {
         link = LinkClient(identity: identity)
         link.delegate = self
         link.manualHost = manualHost.isEmpty ? nil : manualHost
-        audio.onFrame = { [weak link] frame in link?.sendAudio(frame) }
+        audio.onFrame = { [weak link, stats = callStats] frame in
+            stats.out(frame)
+            link?.sendAudio(frame)
+        }
         audio.onError = { [weak self] error in self?.notice = "call audio: \(error.localizedDescription)" }
         notifier.model = self
         if identity.phone == nil { section = .phone }
@@ -127,7 +130,15 @@ final class AppModel: ObservableObject, LinkDelegate {
 
     func linkFound(_ phones: [LinkClient.Found]) { found = phones }
 
-    func linkAudio(_ frame: Data) { audio.play(frame) }
+    func linkAudio(_ frame: Data) {
+        callStats.into(frame)
+        audio.play(frame)
+    }
+
+    /// Frame counts and peak levels both ways, logged every 5 s during a call
+    /// (`log show --predicate 'process == "ito"'`). Tells "silent" from "not arriving".
+    let callStats = CallStats()
+    private var statsTimer: Timer?
 
     func linkReceived(_ m: [String: Any]) {
         switch m["t"] as? String ?? "" {
@@ -389,6 +400,10 @@ final class AppModel: ObservableObject, LinkDelegate {
 
     private func startAudio() {
         guard !audio.running else { return }
+        statsTimer?.invalidate()
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [stats = callStats] _ in
+            NSLog("ito call audio: %@", stats.report())
+        }
         CallAudio.requestMic { [weak self] ok in
             guard let self else { return }
             guard ok else { self.notice = "ito needs the microphone for calls (system settings → privacy → microphone)"; return }
@@ -396,7 +411,11 @@ final class AppModel: ObservableObject, LinkDelegate {
         }
     }
 
-    private func stopAudio() { audio.stop() }
+    private func stopAudio() {
+        audio.stop()
+        statsTimer?.invalidate()
+        statsTimer = nil
+    }
 
     // MARK: pairing
 
@@ -406,5 +425,34 @@ final class AppModel: ObservableObject, LinkDelegate {
         phone = PhoneInfo()
         rebuild()
         section = .phone
+    }
+}
+
+final class CallStats: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inFrames = 0, inPeak = 0, outFrames = 0, outPeak = 0
+
+    func into(_ f: Data) { let p = Self.peak(f); lock.lock(); inFrames += 1; inPeak = max(inPeak, p); lock.unlock() }
+    func out(_ f: Data) { let p = Self.peak(f); lock.lock(); outFrames += 1; outPeak = max(outPeak, p); lock.unlock() }
+
+    func report() -> String {
+        lock.lock(); defer { lock.unlock() }
+        let s = "from phone \(inFrames) frames peak \(inPeak) · to phone \(outFrames) frames peak \(outPeak)"
+        inPeak = 0; outPeak = 0
+        return s
+    }
+
+    private static func peak(_ f: Data) -> Int {
+        guard f.count >= 6 else { return 0 }
+        return f.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+            var p = 0
+            var i = 4
+            while i + 1 < raw.count {
+                let v = Int(Int16(bitPattern: UInt16(raw[i]) | UInt16(raw[i + 1]) << 8))
+                p = max(p, abs(v))
+                i += 2
+            }
+            return p
+        }
     }
 }

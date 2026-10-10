@@ -52,9 +52,34 @@ cp "$APK" "$STAGE/system/priv-app/ito/ito.apk"
 # a module update keeps running the previous APK forever. Drop ito's entry each boot.
 cat > "$STAGE/post-fs-data.sh" <<'SH'
 #!/system/bin/sh
+# Runs before Magisk mounts module files, so it can shape them.
+MODDIR=${0%/*}
 rm -f /data/system/package_cache/*/ito-*
+
+# Call uplink. Qualcomm's in-call music route mixes a playback stream into the call
+# and mutes the phone's own mic while it plays. Audio policy only uses it for a track
+# routed to "Telephony Tx", and this ROM's policy file feeds that device from voice_tx
+# alone (whose "afe-proxy-playback" path is missing). Overlay the phone's OWN file
+# with one change, regenerated every boot so a ROM update can't leave it stale, and
+# dropped entirely if the edit doesn't land exactly.
+SRC=/vendor/etc/audio_policy_configuration.xml
+DST=$MODDIR/system/vendor/etc/audio_policy_configuration.xml
+mkdir -p "${DST%/*}"
+rm -f "$DST"
+if [ -f "$SRC" ] && ! grep -q 'voice_tx,incall_music' "$SRC"; then
+  sed -e '/sink="Telephony Tx"/{n;s/sources="voice_tx"/sources="voice_tx,incall_music"/;}' "$SRC" > "$DST.tmp"
+  if [ "$(grep -c 'sources="voice_tx,incall_music"' "$DST.tmp")" = "1" ] && \
+     [ "$(wc -l < "$DST.tmp")" = "$(wc -l < "$SRC")" ]; then
+    mv "$DST.tmp" "$DST"
+    chmod 644 "$DST"
+    chcon u:object_r:vendor_configs_file:s0 "$DST" 2>/dev/null
+  fi
+  rm -f "$DST.tmp"
+fi
 SH
 chmod 755 "$STAGE/post-fs-data.sh"
+# The HAL side of in-call music is off unless this is set before the audio HAL starts.
+echo "vendor.audio.feature.incall_music.enable=true" > "$STAGE/system.prop"
 cat > "$STAGE/module.prop" <<PROP
 id=ito
 name=ito
