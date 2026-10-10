@@ -45,8 +45,10 @@ Proof in the HAL log: `adev_open_output_stream: Stream picks up usecase (incall_
   outgoing call is dialing and the line is silent.
 - **Keypad tones.** Each digit is held 160 ms and sent one at a time; back-to-back
   play/stop is too short for IMS. The Mac plays the tone locally too.
-- **The phone in the drawer.** While a Mac carries the call the phone is held on the
-  earpiece at minimum volume (restored afterwards); in-call music mutes its mic.
+- **The phone while a Mac has the call.** It's held on the earpiece at minimum volume
+  (restored afterwards, even after a crash); in-call music mutes its mic. Tapping
+  "use phone" on ito's notification, or switching the route on the phone, hands the
+  call back.
 
 ## the Mac side
 

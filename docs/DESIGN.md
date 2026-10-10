@@ -18,12 +18,13 @@ having no MMS. So ito exists.
 
 ## the link: Wi-Fi, phone listens, Mac dials in
 
-The phone is the stationary end: always on power, always on the home Wi-Fi (it needs
-Wi-Fi anyway: no cell signal, so Wi-Fi Calling). The Mac moves. So the phone listens on
-**6969** (meme-port rule; nothing else runs on the phone) and advertises `_ito._tcp`
-over mDNS. The Mac finds it, or uses a typed address.
+The phone holds the SIM, so it is the end everything hangs off: it listens on **6969**
+(meme-port rule; nothing else runs on the phone) and advertises `_ito._tcp` over mDNS.
+The Mac finds it, or uses a typed address. Where the phone is doesn't matter: a pocket,
+the desk, a charger in a drawer. When it leaves the network the link waits, the phone
+carries on as a phone, and the Mac catches up when it's back.
 
-- Not USB: the USB-C cable is power. The phone can be in any drawer in the house.
+- Not USB: it would tie the phone to the Mac. Wi-Fi reaches it anywhere in the house.
 - Not Bluetooth: range, throughput for history sync, and macOS's Bluetooth stack is not
   something to depend on for the whole product. (It is the fallback for call audio,
   see CALLS.md.)
@@ -32,6 +33,14 @@ over mDNS. The Mac finds it, or uses a typed address.
 
 The mDNS name is `ito-<first 8 hex of the phone key's SHA-256>`: the LAN learns that an
 ito phone exists, not whose.
+
+## power
+
+ito can't assume the phone is on a charger. The bridge is a foreground service that the
+Magisk module exempts from Doze (`allow-in-power-save`, like system messaging apps), and
+it holds a wake lock only while a Mac is linked *and* the phone is charging. On battery
+the link's own traffic wakes it. The Mac's only battery notice is the phone's own kind: one
+heads-up at 15% when not charging.
 
 ## security
 
@@ -122,7 +131,7 @@ The system install exists for three privileged permissions:
 phone's dialer stays the dialer), `CALL_AUDIO_INTERCEPTION` (Android 13's call
 redirection API: an `AudioRecord` on the call's downlink and an `AudioTrack` into its
 uplink) and the background-start pair that lets the bridge become a microphone
-foreground service while it lives in a drawer.
+foreground service from the background.
 
 Audio is 16 kHz mono PCM, 20 ms frames, uncompressed: 256 kbit/s each way, nothing on a
 LAN, and no codec in either app. The Mac side runs Apple's voice processing (echo

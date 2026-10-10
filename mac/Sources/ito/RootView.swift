@@ -110,7 +110,8 @@ struct Rail: View {
                 vital("link", linkText, on: model.linked)
                 if model.linked {
                     if let b = model.phone.battery {
-                        vital("battery", "\(b)%" + (model.phone.plugged ? "" : " · unplugged"), on: model.phone.plugged, warn: !model.phone.plugged)
+                        let low = b <= 15 && !model.phone.charging
+                        vital("battery", "\(b)%" + (model.phone.charging ? " · charging" : ""), on: !low, warn: low)
                     }
                     vital("wi-fi calling", model.phone.ims, on: model.phone.ims == "wifi" || model.phone.ims == "cellular")
                 }

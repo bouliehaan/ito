@@ -99,14 +99,14 @@ struct PhoneView: View {
                 Text(model.paired?.name ?? "phone").font(Theme.mono(20, bold: true))
                 row("link", linkText)
                 if model.unreachableSince != nil {
-                    Text("can't reach the phone. that's normal if it's out with you. if it's in the drawer and restarted, unlock it once.")
+                    Text("can't reach the phone. that's normal when it's out with you or on another network. if it restarted, unlock it once.")
                         .font(Theme.mono(12)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
                 }
                 if model.linked {
                     row("number", model.phone.number.isEmpty ? "unknown" : Numbers.pretty(model.phone.number))
                     row("android", "\(model.phone.android) · \(model.phone.model)")
                     if let b = model.phone.battery {
-                        row("battery", "\(b)%" + (model.phone.plugged ? " · on power" : " · NOT on power"), warn: !model.phone.plugged)
+                        row("battery", "\(b)%" + (model.phone.charging ? " · charging" : ""), warn: b <= 15 && !model.phone.charging)
                     }
                     row("wi-fi calling", model.phone.ims)
                     row("texts", model.phone.smsOK ? "ok" : "permissions missing on the phone", warn: !model.phone.smsOK)

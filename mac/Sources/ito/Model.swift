@@ -173,7 +173,7 @@ final class AppModel: ObservableObject, LinkDelegate {
             phone.charging = m["charging"] as? Bool ?? false
             phone.wifi = m["wifi"] as? Bool ?? false
             phone.ims = m["ims"] as? String ?? "unknown"
-            watchDrawer()
+            watchBattery()
         case "sms":
             let rows = m["rows"] as? [[String: Any]] ?? []
             store.upsertSms(rows)
@@ -291,19 +291,20 @@ final class AppModel: ObservableObject, LinkDelegate {
         }
     }
 
-    // MARK: the phone in the drawer
+    // MARK: the phone's health
 
     private var warnedBattery = false
     private var imsDownSince: Date?
     private var warnedIms = false
 
-    /// Only real drawer failures: a phone running flat off its charger, or Wi-Fi Calling
-    /// gone (texts and calls stop working). Unplugging it to take it out is not one of them.
-    private func watchDrawer() {
-        if phone.plugged { warnedBattery = false }
-        if !phone.plugged, let b = phone.battery, b <= 20, !warnedBattery {
+    /// Two things worth a notification wherever the phone is: a battery about to die
+    /// (once, like the phone's own warning), and Wi-Fi Calling gone while on Wi-Fi (texts
+    /// and calls stop working). Being unplugged is not one of them.
+    private func watchBattery() {
+        if phone.charging || (phone.battery ?? 100) > 20 { warnedBattery = false }
+        if !phone.charging, let b = phone.battery, b <= 15, !warnedBattery {
             warnedBattery = true
-            notifier.alert(title: "phone battery \(b)%", body: "it isn't charging. check the cable in the drawer.")
+            notifier.alert(title: "phone battery low", body: "\(b)%, not charging")
         }
         if phone.ims == "wifi" || phone.ims == "cellular" || phone.ims == "registering" {
             imsDownSince = nil

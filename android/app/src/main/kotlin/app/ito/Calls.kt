@@ -177,7 +177,7 @@ class Calls(private val bridge: Bridge) {
     private var quietSince = 0L
 
     /**
-     * While a Mac carries the call, the phone in the drawer should be inert: the in-call
+     * While a Mac carries the call, the phone itself should stay quiet: the in-call
      * music route already mutes its mic, and this keeps the call on the earpiece (never
      * the loudspeaker) at the lowest volume. The user's volume comes back afterwards.
      */

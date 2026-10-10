@@ -6,7 +6,7 @@
 #   CALL_AUDIO_INTERCEPTION     the call's audio, both directions, over the link
 #   MODIFY_PHONE_STATE          required by audio policy for the uplink (TELEPHONY_TX) track
 #   READ_PRECISE_PHONE_STATE    whether Wi-Fi Calling is registered
-#   START_*_FROM_BACKGROUND     go microphone-foreground for a call while in a drawer
+#   START_*_FROM_BACKGROUND     go microphone-foreground for a call while ito is in the background
 #
 # A privileged app that asks for a privileged permission missing from its
 # allowlist can stop the phone booting, so the allowlist is generated from the
@@ -103,12 +103,16 @@ cat > "$STAGE/system/etc/permissions/privapp-permissions-$PKG.xml" <<XML
 $ALLOW    </privapp-permissions>
 </permissions>
 XML
-# The call-audio API is @SystemApi, reached by reflection; system apps on this
-# list are exempt from the hidden-API filter.
-cat > "$STAGE/system/etc/sysconfig/$PKG-hidden-api.xml" <<XML
+# hidden-api: the call-audio API is @SystemApi, reached by reflection; system apps
+#   on this list are exempt from the hidden-API filter.
+# allow-in-power-save: the phone may be in a pocket, not on a charger; Doze would
+#   otherwise cut the link after a while unplugged (the same exemption system
+#   messaging apps get).
+cat > "$STAGE/system/etc/sysconfig/$PKG.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <config>
     <hidden-api-whitelisted-app package="$PKG" />
+    <allow-in-power-save package="$PKG" />
 </config>
 XML
 (cd "$STAGE" && zip -qr -X ../ito-magisk.zip .)

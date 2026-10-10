@@ -83,8 +83,10 @@ class MainActivity : Activity() {
             false -> "not supported by this rom"
             null -> "needs the system install"
         }, if (audio == true) Ui.TEXT else Ui.DIM))
-        body.addView(Ui.row(ctx, "battery", "${st.optInt("batt")}%" + if (st.optBoolean("plugged")) " · on power" else " · NOT on power",
-            if (st.optBoolean("plugged")) Ui.TEXT else Ui.DANGER))
+        val batt = st.optInt("batt")
+        val charging = st.optBoolean("charging")
+        body.addView(Ui.row(ctx, "battery", "$batt%" + if (charging) " · charging" else "",
+            if (batt <= 15 && !charging) Ui.DANGER else Ui.TEXT))
 
         // pairing
         body.addView(Ui.section(ctx, "pairing"))

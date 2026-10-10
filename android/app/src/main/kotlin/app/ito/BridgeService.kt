@@ -8,15 +8,19 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 
 /**
- * Keeps the bridge alive. The phone lives on a charger in a drawer, so Doze
- * never engages; a foreground service is all it takes, plus a partial wake
- * lock while a Mac is linked so nothing waits on the CPU waking up.
+ * Keeps the bridge alive. The phone might be on a charger in a drawer or in a
+ * pocket; ito can't assume either. A foreground service, an exemption from
+ * Doze (the Magisk module grants it), and a partial wake lock only while a Mac
+ * is linked AND the phone is charging: free on power, and on battery the link's
+ * own traffic wakes the phone when it needs to.
  */
 class BridgeService : Service() {
     private val bridge get() = (application as ItoApp).bridge
@@ -31,6 +35,10 @@ class BridgeService : Service() {
         foreground()
         bridge.service = this
         bridge.start()
+        registerReceiver(power, IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+        })
         refresh()
     }
 
@@ -41,19 +49,26 @@ class BridgeService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private val power = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) = refresh()
+    }
+
     override fun onDestroy() {
+        runCatching { unregisterReceiver(power) }
         bridge.service = null
         wake?.takeIf { it.isHeld }?.release()
         super.onDestroy()
     }
 
-    /** Linked-Mac count changed: update the notification and the wake lock. */
+    /** Linked Macs or power changed: update the notification and the wake lock. */
     fun refresh() {
-        val linked = bridge.linked > 0
-        if (linked && wake?.isHeld != true) {
+        val plugged = (registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+        val hold = bridge.linked > 0 && plugged
+        if (hold && wake?.isHeld != true) {
             wake = getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ito:link").apply { setReferenceCounted(false); acquire() }
-        } else if (!linked) {
+        } else if (!hold) {
             wake?.takeIf { it.isHeld }?.release()
         }
         foreground()

@@ -81,7 +81,7 @@ struct MenuContent: View {
     var body: some View {
         Text(model.linked ? "linked to \(model.paired?.name ?? "phone")" : "not linked")
         if let b = model.phone.battery, model.linked {
-            Text("phone \(b)%" + (model.phone.plugged ? "" : " · unplugged"))
+            Text("phone \(b)%" + (model.phone.charging ? " · charging" : ""))
         }
         Divider()
         Button("open ito") {

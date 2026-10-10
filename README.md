@@ -2,8 +2,9 @@
 
 糸, thread. From 糸電話, the tin-can telephone: two cups and a string.
 
-Your Android phone, on your Mac. Put the phone on a charger, put it in a drawer,
-and text and call from the Mac for as long as you like.
+Your Android phone, on your Mac. Text and call from the Mac whenever the phone is on
+your Wi-Fi: in your pocket, on the desk, or on a charger in a drawer for months. The
+phone stays a normal phone the whole time; ito is another way in, never a dependency.
 
 - **texts**: every SMS in and out, full history, the phone's contacts, banners you
   can reply to without opening anything
