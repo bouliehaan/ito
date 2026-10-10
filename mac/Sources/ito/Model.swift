@@ -405,6 +405,9 @@ final class AppModel: ObservableObject, LinkDelegate {
         if call?.id != info.id {
             dialed = ""
             callKeypad = false
+            // A new call: nothing in the main window keeps the keyboard, so typed digits
+            // reach the call. Clicking into a text field takes them back.
+            for w in NSApp.windows where !(w is NSPanel) { w.makeFirstResponder(nil) }
         }
         call = info
         // Outgoing and not yet answered: the Mac plays the ringback the phone would have.

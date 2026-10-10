@@ -57,19 +57,26 @@ MODDIR=${0%/*}
 rm -f /data/system/package_cache/*/ito-*
 
 # Call uplink. Qualcomm's in-call music route mixes a playback stream into the call
-# and mutes the phone's own mic while it plays. Audio policy only uses it for a track
-# routed to "Telephony Tx", and this ROM's policy file feeds that device from voice_tx
-# alone (whose "afe-proxy-playback" path is missing). Overlay the phone's OWN file
-# with one change, regenerated every boot so a ROM update can't leave it stale, and
-# dropped entirely if the edit doesn't land exactly.
+# and mutes the phone's own mic while it plays. Two changes to the phone's OWN policy
+# file make audio policy hand it to ito's uplink track:
+#  - the incall_music output becomes a mixed output (LG declared it DIRECT, and policy
+#    never offers a direct output to a plain PCM track), opened at boot on Telephony Tx;
+#  - Telephony Tx becomes its ONLY destination: it is removed from the earpiece, speaker
+#    and headset routes, so no ordinary sound can ever be mixed into a call.
+# Regenerated from the untouched original every boot (this runs before Magisk mounts
+# anything), and dropped entirely unless the result is exactly what is expected.
 SRC=/vendor/etc/audio_policy_configuration.xml
 DST=$MODDIR/system/vendor/etc/audio_policy_configuration.xml
 mkdir -p "${DST%/*}"
-rm -f "$DST"
-if [ -f "$SRC" ] && ! grep -q 'voice_tx,incall_music' "$SRC"; then
-  sed -e '/sink="Telephony Tx"/{n;s/sources="voice_tx"/sources="voice_tx,incall_music"/;}' "$SRC" > "$DST.tmp"
-  if [ "$(grep -c 'sources="voice_tx,incall_music"' "$DST.tmp")" = "1" ] && \
-     [ "$(wc -l < "$DST.tmp")" = "$(wc -l < "$SRC")" ]; then
+rm -f "$DST" "$DST.tmp"
+if [ -f "$SRC" ]; then
+  sed -e 's/flags="AUDIO_OUTPUT_FLAG_DIRECT|AUDIO_OUTPUT_FLAG_INCALL_MUSIC"/flags="AUDIO_OUTPUT_FLAG_INCALL_MUSIC"/' \
+      -e 's/,incall_music//g' \
+      -e '/sink="Telephony Tx"/{n;s/sources="voice_tx"/sources="voice_tx,incall_music"/;}' "$SRC" > "$DST.tmp"
+  if [ "$(wc -l < "$DST.tmp")" = "$(wc -l < "$SRC")" ] && \
+     [ "$(grep -o 'incall_music' "$DST.tmp" | wc -l)" = "2" ] && \
+     [ "$(grep -c 'sources="voice_tx,incall_music"' "$DST.tmp")" = "1" ] && \
+     [ "$(grep -c 'flags="AUDIO_OUTPUT_FLAG_INCALL_MUSIC"' "$DST.tmp")" = "1" ]; then
     mv "$DST.tmp" "$DST"
     chmod 644 "$DST"
     chcon u:object_r:vendor_configs_file:s0 "$DST" 2>/dev/null

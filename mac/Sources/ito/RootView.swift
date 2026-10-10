@@ -9,6 +9,20 @@ struct RootView: View {
             Rail()
                 .frame(width: 252)
             Hairline(vertical: true)
+            VStack(spacing: 0) {
+                CallBar()
+                content
+            }
+        }
+        // Content stays below the hidden title bar; only the colours run up under it.
+        .background(Theme.bg.ignoresSafeArea())
+        .foregroundStyle(Theme.text)
+        .overlay(alignment: .bottom) { NoticeBar() }
+        .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder private var content: some View {
+        HStack(spacing: 0) {
             switch model.section {
             case .messages:
                 ThreadsColumn().frame(width: 330)
@@ -24,11 +38,57 @@ struct RootView: View {
                 PhoneView()
             }
         }
-        // Content stays below the hidden title bar; only the colours run up under it.
-        .background(Theme.bg.ignoresSafeArea())
-        .foregroundStyle(Theme.text)
-        .overlay(alignment: .bottom) { NoticeBar() }
-        .preferredColorScheme(.dark)
+    }
+}
+
+/// The live call, across the top of the main window, so it is never only in the floating panel.
+struct CallBar: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        if let c = model.call, c.state != "ended" {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                HStack(spacing: 14) {
+                    StatusDot(on: c.state == "active")
+                    Caps(label(c), color: Theme.text, size: 11)
+                    Text(c.title).font(Theme.mono(14, bold: true)).lineLimit(1)
+                    if c.state == "active", c.since > 0 {
+                        Text(Fmt.duration(Int64(ctx.date.timeIntervalSince1970) - c.since / 1000)).font(Theme.mono(13)).foregroundStyle(Theme.dim)
+                    }
+                    if c.full && (c.state == "active" || c.state == "dialing") {
+                        Text("keys 0–9 * # go to the call").font(Theme.mono(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    if c.state == "ringing" {
+                        Button("decline") { model.decline() }.buttonStyle(ConsoleButton(kind: .danger, compact: true))
+                        Button("answer") { model.answer() }.buttonStyle(ConsoleButton(kind: .primary, compact: true)).disabled(!c.full)
+                    } else {
+                        if c.audio {
+                            Button(model.callMuted ? "unmute" : "mute") { model.callMuted.toggle() }
+                                .buttonStyle(ConsoleButton(kind: model.callMuted ? .primary : .ghost, compact: true))
+                        }
+                        if c.full {
+                            Button("keypad") { model.callKeypad.toggle() }
+                                .buttonStyle(ConsoleButton(kind: model.callKeypad ? .primary : .ghost, compact: true))
+                        }
+                        Button("end") { model.hangup() }.buttonStyle(ConsoleButton(kind: .danger, compact: true))
+                    }
+                }
+                .padding(.horizontal, 22)
+                .frame(height: 48)
+                .background(Theme.surface2)
+                .overlay(alignment: .bottom) { Hairline(strong: true) }
+            }
+        }
+    }
+
+    private func label(_ c: CallInfo) -> String {
+        switch c.state {
+        case "ringing": return "incoming"
+        case "dialing": return "calling"
+        case "held": return "on hold"
+        default: return c.audio ? "on call" : "on the phone"
+        }
     }
 }
 

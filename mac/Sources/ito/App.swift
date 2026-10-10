@@ -40,10 +40,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["ITO_AUDIOTEST"] != nil { return AudioTest.run() }
         #endif
         panel = CallPanelController(model: model)
+        watchDigits()
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
         if let dir = env["ITO_SNAPSHOT"], let host = env["ITO_HOST"] { Snapshot.run(model: model, dir: dir, host: host) }
         #endif
+    }
+
+    /// During a call, digits typed anywhere in ito go to the call as keypad tones,
+    /// except into a text field (the composer keeps its digits). The call panel
+    /// handles its own keys.
+    private func watchDigits() {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let c = self.model.call, c.full, c.state == "active" || c.state == "dialing",
+                  event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  let key = event.charactersIgnoringModifiers, key.count == 1, "0123456789*#".contains(key),
+                  let window = NSApp.keyWindow, !(window is CallNSPanel),
+                  !(window.firstResponder is NSText) else { return event }
+            self.model.dtmf(key)
+            return nil
+        }
     }
 
     // Closing the window keeps ito running: texts and calls still arrive.
@@ -122,6 +138,7 @@ enum Snapshot {
 
             await wait("call", 25) { model.call?.state == "ringing" }
             await snap("6-call", window: NSApp.windows.first { $0 is NSPanel })
+            await snap("7-callbar")
             NSApp.terminate(nil)
         }
     }
