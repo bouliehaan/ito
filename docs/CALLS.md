@@ -1,45 +1,55 @@
-# calls: the one thing only the phone can answer
+# calls: how the audio actually gets in and out
 
-Everything else in ito is ordinary Android and is tested on the host. Call audio is the
-exception: it goes through `AudioManager.getCallDownlinkExtractionAudioRecord` and
-`getCallUplinkInjectionAudioTrack` (Android 13, `@SystemApi`), and whether they carry a
-live **Wi-Fi Calling** call on this phone depends on LG's IMS stack and the Qualcomm
-audio HAL underneath.
+Verified on the V60, 2026-10-09: outgoing calls, voicemail PINs from the Mac keypad, a
+voicemail left on another line that sounded like the headphones, not the phone.
 
-## why it is worth trying
+## the other person (downlink)
 
-The V60's LineageOS audio policy (`device/lge/timelm`, `configs/audio/audio_policy_configuration.xml`)
-declares exactly what the API looks for:
+`AudioManager.getCallDownlinkExtractionAudioRecord` (Android 13 call redirection,
+`@SystemApi`, needs `CALL_AUDIO_INTERCEPTION`). On this phone it lands on Qualcomm's
+call-recording path, `incall-rec-downlink`, and the call stays on the earpiece. Plain
+`VOICE_DOWNLINK` capture is the fallback.
 
-- attached devices `Telephony Tx` and `Telephony Rx`
-- routes `voice_tx → Telephony Tx` and `Telephony Rx → voice_rx`
+## you (uplink)
 
-`isPstnCallAudioInterceptable()` returns true when both devices are attached, so the API
-should at least open. Whether audio actually flows on an IMS-over-Wi-Fi call is the open
-question.
+Android's own injection track (`getCallUplinkInjectionAudioTrack`) opens but carries
+nothing here: it plays to the `afe-proxy-playback` route, which this ROM's mixer paths
+do not have, so the caller heard the phone's own mic instead.
 
-## the test, after installing the Magisk module
+What works is Qualcomm's **in-call music** (`incall_music_uplink`, built for music on
+hold): it mixes a playback stream into the call and mutes the phone's mic while it
+plays. Audio policy hands it to a track that is routed explicitly to the Telephony Tx
+device (`setPreferredDevice(TYPE_TELEPHONY)`, usage `VOICE_COMMUNICATION`), but on the
+V60 three things stood in the way. The Magisk module fixes all three:
 
-1. `tools/phone-status.sh`: `install: system (privileged)`, and `CALL_AUDIO_INTERCEPTION granted`.
-2. ito on the phone, status: `call audio: over the link` (that is `isPstnCallAudioInterceptable() == true`).
-3. From another phone, call the V60. The Mac rings. Answer on the Mac.
-   - **You hear them**: the downlink works.
-   - **They hear you**: the uplink works.
-   - Errors show as a notice on the Mac (`downlink: …` / `uplink: …`) and in
-     `adb logcat -s ito-audio ito-calls`.
-4. Dial out from the Mac, same checks.
+1. **The HAL feature is off.** `vendor.audio.feature.incall_music.enable=true`
+   (module `system.prop`). The V60 runs LG's prebuilt HAL, which reads that property.
+2. **LG declared the `incall_music` output DIRECT.** AOSP's `openDirectOutput` never
+   offers a direct output to a plain PCM track. The overlay makes it a mixed output.
+3. **It had no route to Telephony Tx**, and did have routes to the earpiece, speaker and
+   headsets. The overlay makes Telephony Tx its **only** route, so nothing but ito's
+   uplink can ever be mixed into a call.
 
-Note: in this mode the phone's own mic stays open alongside the injected Mac audio
-(the call is not in "redirect" mode). In a drawer that adds drawer silence. If it turns
-out to matter, the next step is muting the phone mic during Mac calls, which needs
-testing because on some Qualcomm builds muting also mutes the injected audio.
+The overlay is `post-fs-data.sh`: every boot, before Magisk mounts anything, it rebuilds
+`/vendor/etc/audio_policy_configuration.xml` from the phone's untouched original with
+exactly those edits, checks the result (line count, exactly two `incall_music`
+mentions), and drops the overlay entirely if anything is off. `ito-audio` in logcat
+logs which path each direction used and the levels every 5 s.
 
-## if it does not carry audio
+Proof in the HAL log: `adev_open_output_stream: Stream picks up usecase (incall_music_uplink)`.
 
-The fallback is **Bluetooth Hands-Free**: the Mac acts as a car kit, and the phone routes
-call audio to it like any headset. `IOBluetoothHandsFreeDevice` is still in the macOS 27
-SDK, not deprecated: dial, answer, end, DTMF, SCO audio. Costs: Bluetooth range (the phone's
-drawer must be within ~10 m), HFP voice quality (16 kHz at best), and another pairing.
-Call *control* would stay on the ito link; only the audio would move to Bluetooth.
+## the bits a phone normally does locally
 
-Nothing of the fallback is built yet. Build it only if step 3 fails.
+- **Ringback.** Telecom plays it on the phone itself (RingbackPlayer) when the network
+  sends none, so it never travels the call. The Mac synthesizes US ringback while an
+  outgoing call is dialing and the line is silent.
+- **Keypad tones.** Each digit is held 160 ms and sent one at a time; back-to-back
+  play/stop is too short for IMS. The Mac plays the tone locally too.
+- **The phone in the drawer.** While a Mac carries the call the phone is held on the
+  earpiece at minimum volume (restored afterwards); in-call music mutes its mic.
+
+## the Mac side
+
+Apple's voice processing (echo cancellation) when the devices allow it. A Bluetooth
+headset in call mode can refuse it (-10875); then the plain engine runs (no echo to
+cancel in headphones), remembered per device so the next call starts instantly.

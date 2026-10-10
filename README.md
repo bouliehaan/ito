@@ -21,12 +21,15 @@ Calls need a rooted phone (see below).
 
 ## status, 2026-10-09
 
+Running on the V60 (LineageOS 23.2, Magisk) and a Mac mini on macOS 27.
+
 | | |
 |---|---|
-| crypto + link | verified: both Noise implementations reproduce the official cacophony vector; the Swift client pairs with, syncs from and group-sends through the Kotlin phone over a real socket (`swift test`) |
-| Mac app | verified against the fake phone: pairing, threads, relay group, calls tab, settings, call panel all rendered (`tools/snapshot.sh`) |
-| Android app | builds clean, 180 KB. **Not yet run on the V60.** |
-| call audio | **unverified, and the one real unknown.** Android has a documented API for it and the V60's audio policy declares the devices it needs, but whether LG's IMS honours it on a Wi-Fi call is only answerable on the phone. [docs/CALLS.md](docs/CALLS.md) is the test, plus the fallback. |
+| texts | verified both ways on the real phone, history synced |
+| calls out | verified: voicemail reached, PIN entered from the Mac keypad, a voicemail left on another line sounded clean |
+| calls in | ring + popup verified; answering on the Mac uses the same audio path but is not yet tried with a real person |
+| group texts | engine tested on the host and against the fake phone; not yet used with real people |
+| crypto + link | both Noise implementations reproduce the official cacophony vector; Swift ↔ Kotlin interop test over a real socket |
 
 ## what's where
 
