@@ -95,3 +95,8 @@ phone.
   one-click "make it an ito group".
 - The Mac app is signed ad hoc, so macOS asks again for the microphone and Keychain after
   each rebuild. `ITO_SIGN="<identity>" mac/build.sh` signs with a real certificate.
+
+## license
+
+GPL-3.0 (`LICENSE`). Office Code Pro is under the SIL Open Font License
+(`mac/Resources/Fonts/OFL.txt`).
