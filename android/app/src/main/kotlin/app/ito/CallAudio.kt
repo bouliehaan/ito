@@ -66,6 +66,7 @@ class CallAudio(private val ctx: Context) {
         val trk = opened?.first
         val uplinkProblem = if (trk == null) (lastProblem ?: "uplink refused") else null
         Log.i(TAG, "call audio: downlink via $downVia, uplink via ${opened?.second ?: "nothing ($uplinkProblem)"}")
+        uplinkVia = opened?.second
         record = rec
         track = trk
         inbox.clear()
@@ -78,7 +79,10 @@ class CallAudio(private val ctx: Context) {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             var seq = 0
             val pcm = ByteArray(FRAME_BYTES)
-            var lastReport = System.currentTimeMillis()
+            val began = System.currentTimeMillis()
+            var lastReport = began
+            var upAtReport = 0L
+            var quiet = false
             while (running) {
                 var got = 0
                 while (got < FRAME_BYTES && running) {
@@ -96,6 +100,12 @@ class CallAudio(private val ctx: Context) {
                     Log.i(TAG, "call audio: down $downFrames frames peak $downPeak · up $upFrames frames peak $upPeak, $upStarved silent fills")
                     downPeak = 0; upPeak = 0
                     lastReport = now
+                    // Nothing from the Mac's microphone for a whole report (after a few
+                    // seconds of grace to get going): say so once, so the Mac can show it.
+                    val fresh = upFrames > upAtReport
+                    upAtReport = upFrames
+                    if (trk != null && !fresh && !quiet && now - began > 6000) { quiet = true; onMacQuiet?.invoke() }
+                    if (fresh) quiet = false
                 }
             }
         }, "ito-downlink").start()
@@ -115,6 +125,13 @@ class CallAudio(private val ctx: Context) {
         }, "ito-uplink").start()
         return Start(true, null)
     }
+
+    /** "in-call music" or "call redirection" while running; null when there is no uplink. */
+    @Volatile var uplinkVia: String? = null
+        private set
+
+    /** The Mac's microphone stopped arriving (or never did) during a call. Audio thread. */
+    @Volatile var onMacQuiet: (() -> Unit)? = null
 
     @Volatile private var lastProblem: String? = null
     @Volatile private var downFrames = 0L
@@ -158,7 +175,8 @@ class CallAudio(private val ctx: Context) {
 
     /**
      * You. First choice: Qualcomm's in-call music ("incall_music_uplink"), which mixes a
-     * playback stream into the uplink and mutes the phone's own mic while it plays. Audio
+     * playback stream into the uplink. It does NOT mute the phone's own mic by itself; it
+     * makes a call mute act on the mic alone, so Calls mutes the call once this runs. Audio
      * policy only selects it for a track routed explicitly to the Telephony Tx device, and
      * on the V60 that needs two things the Magisk module supplies: the HAL feature
      * property and an incall_music → Telephony Tx route in the policy file.
@@ -231,6 +249,7 @@ class CallAudio(private val ctx: Context) {
         runCatching { track?.release() }
         record = null
         track = null
+        uplinkVia = null
         inbox.clear()
     }
 

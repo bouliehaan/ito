@@ -51,7 +51,13 @@ class Calls(private val bridge: Bridge) {
     private val nextId = AtomicInteger(1)
     @Volatile private var service: InCallService? = null
 
-    val audio = CallAudio(bridge.ctx)
+    val audio = CallAudio(bridge.ctx).also { a ->
+        a.onMacQuiet = {
+            Log.w("ito-calls", "no microphone from the Mac")
+            audioOwner?.post(JSONObject().put("t", "error").put("for", "audio")
+                .put("msg", "the call isn't getting your Mac's microphone. they can't hear you; \"move to phone\" hands it back"))
+        }
+    }
     @Volatile private var audioOwner: PhoneLink.Session? = null
     @Volatile private var audioCall: String? = null
     /** Calls a Mac answered or dialed: audio follows them there as soon as they go active. */
@@ -177,9 +183,12 @@ class Calls(private val bridge: Bridge) {
     private var quietSince = 0L
 
     /**
-     * While a Mac carries the call, the phone itself should stay quiet: the in-call
-     * music route already mutes its mic, and this keeps the call on the earpiece (never
-     * the loudspeaker) at the lowest volume. The user's volume comes back afterwards.
+     * While a Mac carries the call, the phone itself stays out of it: the call is held on
+     * the earpiece (never the loudspeaker) at the lowest volume, and its mic is muted.
+     * In-call music does not silence the phone's mic on its own; what it does is make a
+     * call mute act on the mic alone, so the Mac's voice keeps flowing while the phone's
+     * mic is off. (Muting before in-call music runs would silence the Mac too, so only
+     * then.) Volume and mic come back afterwards.
      */
     @Suppress("DEPRECATION")
     private fun quietPhone(on: Boolean) {
@@ -191,6 +200,11 @@ class Calls(private val bridge: Bridge) {
                 quietSince = System.currentTimeMillis()
                 service?.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
                 am.setStreamVolume(stream, am.getStreamMinVolume(stream), 0)
+                if (audio.uplinkVia == "in-call music" && service?.callAudioState?.isMuted != true) {
+                    prefs.edit().putBoolean(MUTED_BY_ITO, true).commit()
+                    service?.setMuted(true)
+                    Log.i("ito-calls", "phone mic muted while the Mac carries the call")
+                }
             } else {
                 restoreVolume()
             }
@@ -199,9 +213,20 @@ class Calls(private val bridge: Bridge) {
 
     /** Also called at every start: undo a quieting that a crash or restart left behind. */
     fun restoreVolume() {
-        if (!prefs.contains(SAVED_VOLUME) || audioCall != null) return
+        if (audioCall != null) return
+        unmutePhone()
+        if (!prefs.contains(SAVED_VOLUME)) return
         runCatching { am.setStreamVolume(android.media.AudioManager.STREAM_VOICE_CALL, prefs.getInt(SAVED_VOLUME, 0), 0) }
         prefs.edit().remove(SAVED_VOLUME).commit()
+    }
+
+    /** Only a mute ito made: a call the user muted on the phone stays muted. */
+    private fun unmutePhone() {
+        if (!prefs.getBoolean(MUTED_BY_ITO, false)) return
+        runCatching { service?.setMuted(false) ?: am.setMicrophoneMute(false) }
+            .onFailure { Log.w("ito-calls", "could not unmute the phone: $it") }
+        prefs.edit().remove(MUTED_BY_ITO).commit()
+        Log.i("ito-calls", "phone mic back on")
     }
 
     /**
@@ -251,6 +276,8 @@ class Calls(private val bridge: Bridge) {
     }
 
     private fun stopAudio() {
+        // The phone's mic first, while in-call music still makes the mute a mic-only one.
+        unmutePhone()
         audio.stop()
         val id = audioCall
         audioOwner = null
@@ -296,6 +323,7 @@ class Calls(private val bridge: Bridge) {
 
     private companion object {
         const val SAVED_VOLUME = "voiceVolumeBeforeMac"
+        const val MUTED_BY_ITO = "micMutedForMac"
     }
 
     private fun stateName(s: Int) = when (s) {

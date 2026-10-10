@@ -1,7 +1,10 @@
 import AppKit
 import Foundation
 import ItoKit
+import os
 import SwiftUI
+
+private let audioLog = Logger(subsystem: "app.ito", category: "audio")
 
 struct PhoneInfo: Equatable {
     var name = "", model = "", android = "", number = "", fingerprint = ""
@@ -506,11 +509,13 @@ final class AppModel: ObservableObject, LinkDelegate {
         guard !audio.running else { return }
         statsTimer?.invalidate()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [stats = callStats] _ in
-            NSLog("ito call audio: %@", stats.report())
+            audioLog.info("call audio: \(stats.report(), privacy: .public)")
         }
         CallAudio.requestMic { [weak self] ok in
             guard let self else { return }
             guard ok else { self.notice = "ito needs the microphone for calls (system settings → privacy → microphone)"; return }
+            // The permission prompt can outlast the call: start only if this call still wants audio here.
+            guard let c = self.call, c.audio, self.wantAudio == c.id else { return self.stopAudio() }
             self.audio.start()
         }
     }

@@ -2,6 +2,9 @@ import AVFoundation
 import CoreAudio
 import Foundation
 import ItoObjC
+import os
+
+private let log = Logger(subsystem: "app.ito", category: "audio")
 
 /// The Mac's half of a call: microphone out, the other person in.
 ///
@@ -17,6 +20,12 @@ import ItoObjC
 /// goes through ITOCatch, and a configuration change rebuilds the graph instead
 /// of leaving it dead. A strange device can produce an error, never a crash.
 ///
+/// Every start, and every fallback from voice processing, gets a brand new engine.
+/// An engine that has had voice processing turned on and off again plays fine but its
+/// microphone delivers nothing (seen with a USB interface in and Bluetooth out), so the
+/// caller hears silence. A watchdog checks that microphone frames actually arrive and
+/// rebuilds once more if they don't.
+///
 /// Wire format matches the phone: 16 kHz mono s16le, 320 samples (20 ms) per
 /// frame, prefixed by a big-endian u32 sequence number.
 public final class CallAudio {
@@ -25,7 +34,7 @@ public final class CallAudio {
         case step(String, Error)
         public var errorDescription: String? {
             switch self {
-            case .noInput: return "no microphone input available"
+            case .noInput: return "the Mac's microphone isn't delivering any sound"
             case .step(let s, let e): return "\(s): \((e as NSError).domain) \((e as NSError).code) \(e.localizedDescription)"
             }
         }
@@ -42,8 +51,8 @@ public final class CallAudio {
     public var onError: ((Error) -> Void)?
     public var muted = false
 
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private let wire = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private var attached = false
@@ -59,6 +68,9 @@ public final class CallAudio {
 
     private let lock = NSLock()
     private var queued = 0
+    private var micFrames = 0
+    private var watchdog: DispatchWorkItem?
+    private var revived = 0
     public private(set) var running = false
 
     public init() {}
@@ -86,28 +98,47 @@ public final class CallAudio {
     public func start() {
         guard !running else { return }
         running = true
+        revived = 0
         // A device that refused once refuses every time; do not spend the first seconds of a call finding out again.
         voiceProcessing = !Self.refusesVoiceProcessing.contains(Self.defaultInputUID() ?? "")
+        log.info("start: voice processing \(self.voiceProcessing ? "on" : "off", privacy: .public)")
+        freshEngine()
+        attempt(0)
+    }
+
+    /// Throws the old engine away (if any) and makes a new one.
+    private func freshEngine() {
+        teardown()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        attached = false
+        converter = nil
+        converterFrom = nil
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
                                                           queue: .main) { [weak self] _ in self?.scheduleRebuild() }
-        attempt(0)
     }
 
     private func attempt(_ n: Int) {
         guard running else { return }
         do {
             try configure()
+            log.info("started (attempt \(n), voice processing \(self.voiceProcessing ? "on" : "off", privacy: .public))")
+            watchMic()
             onStarted?()
         } catch {
+            log.error("attempt \(n) failed: \(error.localizedDescription, privacy: .public)")
             _ = ITOCatch({
                 self.engine.inputNode.removeTap(onBus: 0)
                 self.engine.stop()
             }, nil)
             if voiceProcessing && n >= 2 {
-                // Refused three times in a row: not a transient switch. Go without it.
+                // Refused three times in a row: not a transient switch. Go without it, on a
+                // new engine: this one's microphone would stay dead.
                 voiceProcessing = false
                 if let uid = Self.defaultInputUID() { Self.refusesVoiceProcessing.insert(uid) }
-                try? engine.inputNode.setVoiceProcessingEnabled(false)
+                log.info("voice processing refused by this input; continuing without it")
+                freshEngine()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.attempt(0) }
             } else if n < 12 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.attempt(n + 1) }
@@ -118,12 +149,36 @@ public final class CallAudio {
         }
     }
 
+    /// Started is not the same as hearing you. If the microphone delivers nothing within a
+    /// second and a half, rebuild on a new engine; twice without luck is an error the user sees.
+    private func watchMic() {
+        watchdog?.cancel()
+        lock.lock(); micFrames = 0; lock.unlock()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.running else { return }
+            self.lock.lock(); let got = self.micFrames; self.lock.unlock()
+            guard got == 0 else { return }
+            log.error("microphone delivered nothing (revive \(self.revived))")
+            if self.revived >= 2 {
+                self.onError?(AudioError.noInput)
+                return
+            }
+            self.revived += 1
+            self.freshEngine()
+            self.attempt(0)
+        }
+        watchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
     public func stop() {
         guard running else { return }
         running = false
+        log.info("stop")
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
         rebuild?.cancel()
+        watchdog?.cancel()
         teardown()
     }
 
@@ -248,7 +303,6 @@ public final class CallAudio {
             self.player.stop()
             self.engine.stop()
         }, nil)
-        try? engine.inputNode.setVoiceProcessingEnabled(false)
         lock.lock(); queued = 0; lock.unlock()
     }
 
@@ -296,6 +350,7 @@ public final class CallAudio {
 
     private func captured(_ buf: AVAudioPCMBuffer) {
         guard buf.frameLength > 0 else { return }
+        lock.lock(); micFrames += 1; lock.unlock()
         // Voice processing can report several channels; the processed voice is the first.
         // Take it alone, so the converter only ever resamples mono → mono.
         let source: AVAudioPCMBuffer
