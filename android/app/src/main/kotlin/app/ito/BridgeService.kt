@@ -85,7 +85,7 @@ class BridgeService : Service() {
         }
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val b = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_fg)
+            .setSmallIcon(R.drawable.ic_stat_ito)
             .setContentTitle("ito")
             .setContentText(text)
             .setContentIntent(open)
