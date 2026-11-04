@@ -143,6 +143,39 @@ The allowlist the module ships is generated from the APK's manifest, and the mod
 fails on any permission it has not classified, because a privileged app missing an
 allowlisted permission can stop the phone booting.
 
+## the wall
+
+A [secondbrain](https://github.com/bouliehaan/secondbrain) wall on the same Wi-Fi can show
+"text from mom" while the phone is in a drawer and nobody is at the Mac. The **phone** tells
+it, not the Mac: the phone is the one that is always on the network, and a Mac mini asleep
+under a desk would leave the wall blank exactly when it is wanted.
+
+- **Who, how many, when. Never what.** A report is one entry per conversation with something
+  unanswered in it: the contact's name (or the number), a count, the newest time, the ito
+  group if it is filed in one. The body never leaves the phone this way.
+- **Unanswered** = unread on the phone, newer than what the Mac has shown someone sitting at
+  it, and newer than anything you sent back into that conversation. Replying from the Mac, the
+  phone or a banner is reading it. A conversation left open on a Mac nobody is at (no input
+  for a minute) does not count as read, which is the case the wall exists for.
+- **Whole state, every time.** Every post replaces the last, so a lost post is fixed by the
+  next one and "take that card down" is just the card missing. The phone posts when the texts
+  change, when the Mac says it has shown something, and every 10 minutes, so a wall that
+  restarted has its cards back soon. The wall decides how long a card stays: two hours for a
+  person, half an hour for a short code.
+- **Signed, not encrypted.** `enable-ito` on the wall makes a 32-byte key and prints it with
+  the wall's address; you paste that line into the Mac, which hands it to the phone over the
+  link. Every post carries `HMAC-SHA256(key, "ito-wall/1\n" + time + "\n" + body)` and the
+  wall refuses anything unsigned, more than 5 minutes off its clock, or older than the last
+  post it took. Encrypting would hide nothing: the wall puts these names on a screen and serves
+  its page to the whole LAN. The signature is what stops anything else on the Wi-Fi putting a
+  fake "text from mom" up.
+- **Plain HTTP, so the manifest allows cleartext.** That is the only HTTP ito does; the Mac
+  link is Noise over a raw socket and never was. The key lives in the app's private files,
+  like the group list.
+
+**Cost:** a few hundred bytes every 10 minutes and on every text. A phone asleep on battery
+posts its heartbeat late; a text wakes it, and it holds a wake lock until the wall has heard.
+
 ## the Mac app
 
 SwiftUI, no Xcode project: SwiftPM builds, `mac/build.sh` assembles the bundle. 2 MB.

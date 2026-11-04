@@ -87,6 +87,14 @@ class MainActivity : Activity() {
         val charging = st.optBoolean("charging")
         body.addView(Ui.row(ctx, "battery", "$batt%" + if (charging) " · charging" else "",
             if (batt <= 15 && !charging) Ui.DANGER else Ui.TEXT))
+        bridge.wall.config?.let { wall ->
+            val last = bridge.wall.state
+            body.addView(Ui.row(ctx, "wall", when {
+                last == null -> wall.url.substringAfter("://")
+                last.ok -> if (last.cards == 0) "nothing unread" else "${last.cards} on the wall"
+                else -> last.error ?: "not answering"
+            }, if (last?.ok == false) Ui.DIM else Ui.TEXT))
+        }
 
         // pairing
         body.addView(Ui.section(ctx, "pairing"))

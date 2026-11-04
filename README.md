@@ -13,6 +13,9 @@ phone stays a normal phone the whole time; ito is another way in, never a depend
 - **group texts without MMS**: MMS needs mobile data; a phone on Wi-Fi Calling has
   none. ito groups run on the phone over plain SMS, and *relay* groups forward each
   reply to everyone else, so they work as a real group chat through your number.
+- **"text from mom" on the wall**: with a [secondbrain](https://github.com/bouliehaan/secondbrain)
+  dashboard on the same Wi-Fi, the phone puts who has texted you on it, for two hours or until
+  you read or answer. Who and how many, never what they said. Mac on or off.
 - **no server, no account, no cloud**: phone and Mac talk directly over an
   end-to-end-encrypted link (Noise XX), paired once by comparing a six-digit code.
 
@@ -81,6 +84,17 @@ compare the six digits on both screens → accept on both.
 
 `tools/phone-status.sh` reports, read-only and without root, what state ito is in on the
 phone.
+
+**Wall (optional).** On the secondbrain box:
+
+```
+sudo /usr/share/secondbrain/ito/enable-ito
+```
+
+It prints one line, `http://<wall>:43761 <key>`. In ito on the Mac: settings → `// wall` →
+paste it → set. The Mac hands it to the phone over the link; from then on the phone tells
+the wall by itself. The phone's screen and the Mac's settings both say whether the wall is
+answering. [DESIGN](docs/DESIGN.md#the-wall) has why it works this way.
 
 ## things to know
 

@@ -57,13 +57,15 @@ phone → {"t":"auth","state":"trusted"}   once both sides said ok; both pin the
 | `dtmf` | `id`, `d` | |
 | `hold` | `id`, `on` | |
 | `audio` | `id`, `on` | take (or release) a call's audio on this Mac |
+| `wall` | `url`, `key` | the line `enable-ito` printed on the wall; `url: null` stops telling any wall. → `wall`, or `error` |
+| `seen` | `marks: {thread key: ms}` | shown here, by someone at the Mac, up to that time; the phone takes those cards off the wall. Thread keys as the Mac builds them: `t:<thread id>`, `g:<group id>` |
 | `ping` | | → `pong`. Every 15 s; the phone drops a Mac silent for 45 s |
 
 ## phone → mac
 
 | t | fields |
 |---|---|
-| `hello` | `name`, `model`, `android`, `number`, `fp`, `system` (privileged install), `callAudio` (`ok` / `unsupported` / `needs-system-install`), `sms` (permissions ok) |
+| `hello` | `name`, `model`, `android`, `number`, `fp`, `system` (privileged install), `callAudio` (`ok` / `unsupported` / `needs-system-install`), `sms` (permissions ok), `wall` (see below; present, even as null, means the phone takes `wall` and `seen`) |
 | `status` | `batt`, `charging`, `plugged`, `temp`, `wifi`, `ims` (`wifi` / `cellular` / `registering` / `off` / `unknown`) — on connect, every 60 s, on IMS change |
 | `sms` | `rows`, `done`? — upsert |
 | `sms.ids` | `ids`, `done` — the phone's full id list, chunked; the Mac deletes what is missing |
@@ -74,6 +76,7 @@ phone → {"t":"auth","state":"trusted"}   once both sides said ok; both pin the
 | `call` | `id`, `state` (`ringing` / `dialing` / `active` / `held` / `ended`), `n`, `nm`, `dir`, `since`, `audio`, `full` |
 | `sent` | `cid`, `to`, `ok`, `err` |
 | `synced` | end of a sync |
+| `wall` | `wall`: `null`, or `{url, state?: {at, ok, cards, err}}` — the wall's address (never the key) and how the last post went. Sent when that changes |
 | `error` | `for`, `msg` |
 
 Rows are packed under 48 KB of JSON per frame.
@@ -89,3 +92,32 @@ Rows are packed under 48 KB of JSON per frame.
 - **contact** `{k, n, p[], ph}`
 - **call log** `{id, n, nm, ty, d, dur}`: `ty` as `CallLog.Calls.TYPE`.
 - **group** `{id, name, members[], relay, created}`
+
+## phone → wall
+
+Not the link: plain HTTP to a [secondbrain](https://github.com/bouliehaan/secondbrain) wall,
+whenever the unanswered texts change and every 10 minutes ([DESIGN](DESIGN.md#the-wall)).
+
+```
+POST <url>/secondbrain/ito
+Content-Type: application/x-ito-wall
+X-Ito-Time: <ms, the phone's clock>
+X-Ito-Signature: hex HMAC-SHA256(key, "ito-wall/1\n" + time + "\n" + body)
+
+{"v": 1, "texts": [{"id": "3fa9c1d2e4b5", "from": "Mom", "n": 2, "at": 1793836700000, "group": "trip", "person": true}]}
+```
+
+`id` = first 12 hex of SHA-256(`"ito-wall/" + thread key`); `person` is false for short codes
+and named senders. The key is 32 bytes, base64url without padding (43 characters).
+
+| answer | |
+|---|---|
+| 200 `{"ok": true, "cards": n}` | taken |
+| 403 `{"error": "signature"}` | wrong key |
+| 403 `{"error": "clock", "skewMs"}` | more than 5 min apart |
+| 409 `{"error": "stale"}` | not newer than the last one taken |
+| 404 `{"error": "off"}` | `enable-ito` not run on the wall |
+| 403 with a page, not JSON | MagicMirror's `ipWhitelist` |
+
+`android/link/src/test/kotlin/app/ito/link/WallTest.kt` pins the signature to one computed by
+the wall's own code.

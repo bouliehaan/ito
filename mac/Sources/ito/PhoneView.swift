@@ -6,6 +6,8 @@ struct PhoneView: View {
     @EnvironmentObject var model: AppModel
     @State private var confirmForget = false
     @State private var address = ""
+    @State private var wallLine = ""
+    @State private var wallProblem: String?
 
     var body: some View {
         ScrollView {
@@ -16,6 +18,7 @@ struct PhoneView: View {
                 }
                 if model.paired == nil || isPairing { pairing } else { phoneCard }
                 linkSettings
+                if model.paired != nil && !isPairing { wallSettings }
             }
             .padding(32)
             .frame(maxWidth: 760, alignment: .leading)
@@ -151,6 +154,49 @@ struct PhoneView: View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
             Caps(k, size: 11).frame(width: 130, alignment: .leading)
             Text(v).font(Theme.mono(14)).foregroundStyle(warn ? Theme.danger : Theme.text).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: wall
+
+    private var wallSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHead("wall")
+            Text("a secondbrain wall on this network can show who has texted you: for two hours, or until you read or answer it, here or on the phone. never what they said. on the wall run sudo /usr/share/secondbrain/ito/enable-ito and paste the line it prints. the phone keeps it, so this mac can be asleep.")
+                .font(Theme.mono(13)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+            if let w = model.phone.wall {
+                row("wall", w.url)
+                row("last", wallStatus(w), warn: w.ok == false)
+            }
+            HStack {
+                ConsoleField(placeholder: "http://192.168.1.50:43761 key", text: $wallLine, size: 14, onSubmit: setWall).frame(width: 420)
+                Button("set", action: setWall)
+                    .buttonStyle(ConsoleButton(kind: .ghost, compact: true))
+                    .disabled(wallLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if model.phone.wall != nil {
+                    Button("turn off") { model.clearWall() }
+                        .buttonStyle(ConsoleButton(kind: .danger, compact: true))
+                        .disabled(!model.linked)
+                }
+            }
+            if let problem = wallProblem {
+                Text(problem).font(Theme.mono(13)).foregroundStyle(Theme.danger).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func setWall() {
+        wallProblem = model.setWall(wallLine)
+        if wallProblem == nil { wallLine = "" }
+    }
+
+    private func wallStatus(_ w: WallInfo) -> String {
+        guard let ok = w.ok else { return "the phone hasn't tried it yet" }
+        guard ok else { return w.error ?? "not answering" }
+        switch w.cards ?? 0 {
+        case 0: return "answering · nothing unread"
+        case 1: return "answering · 1 card up"
+        case let n: return "answering · \(n) cards up"
         }
     }
 

@@ -49,12 +49,16 @@
 
     <uses-feature android:name="android.hardware.telephony" android:required="true" />
 
+    <!-- usesCleartextTraffic: the one plain-HTTP thing ito does is tell a secondbrain wall
+         on the LAN who has texted (WallReporter). Signed, and names and counts only, never
+         a text. The link to the Mac is Noise over a raw socket and was never HTTP. -->
     <application
         android:name=".ItoApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="ito"
         android:supportsRtl="false"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Ito">
 
         <activity

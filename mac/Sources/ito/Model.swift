@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import Foundation
 import ItoKit
 import os
@@ -16,6 +17,9 @@ struct PhoneInfo: Equatable {
     var charging = false
     var wifi = false
     var ims = "unknown"
+    /// The phone can tell a wall: its hello has "wall" (null while none is set).
+    var wallCapable = false
+    var wall: WallInfo?
 }
 
 struct CallInfo: Equatable {
@@ -183,6 +187,8 @@ final class AppModel: ObservableObject, LinkDelegate {
             phone.system = m["system"] as? Bool ?? false
             phone.callAudio = m["callAudio"] as? String ?? "unknown"
             phone.smsOK = m["sms"] as? Bool ?? true
+            phone.wallCapable = m.keys.contains("wall")
+            phone.wall = WallInfo(m["wall"])
         case "status":
             phone.battery = (m["batt"] as? NSNumber)?.intValue
             phone.plugged = m["plugged"] as? Bool ?? true
@@ -251,6 +257,13 @@ final class AppModel: ObservableObject, LinkDelegate {
             notifyAfterSms = store.maxSms
             notifyAfterCall = store.maxCall
             announceCatchUp()
+            // Whatever was read here while the link was down, so its wall cards come down too.
+            let since = Int64(Date().timeIntervalSince1970 * 1000) - 12 * 3_600_000
+            wallSeen = wallSeen.filter { $0.value > since }
+            tellWallSeen(wallSeen)
+        case "wall":
+            phone.wallCapable = true
+            phone.wall = WallInfo(m["wall"])
         case "error":
             notice = (m["msg"] as? String) ?? "the phone could not do that"
         default:
@@ -337,6 +350,10 @@ final class AppModel: ObservableObject, LinkDelegate {
     private func markSelectedRead() {
         guard NSApp?.isActive == true, section == .messages, let key = selected, let last = messages(key).last else { return }
         store.markRead(key, upTo: last.date)
+        if last.date > (wallSeen[key] ?? 0), someoneHere {
+            wallSeen[key] = last.date
+            tellWallSeen([key: last.date])
+        }
         if let i = threads.firstIndex(where: { $0.id == key }), threads[i].unread > 0 {
             threads = Conversations.threads(store, built: built)
         }
@@ -355,6 +372,37 @@ final class AppModel: ObservableObject, LinkDelegate {
             let title = s.g.flatMap { g in store.groups.first { $0.id == g }?.name }.map { "\(who) · \($0)" } ?? who
             notifier.text(title: title, body: s.b, thread: key)
         }
+    }
+
+    // MARK: the wall
+
+    /// Hand the phone the line enable-ito printed on the wall. Answers why not, when it can't.
+    func setWall(_ line: String) -> String? {
+        guard linked else { return "the phone has to be linked to change this." }
+        guard phone.wallCapable else { return "the phone's ito is older than this one. update it, then try again." }
+        guard let w = WallInfo.parse(line: line) else { return "that isn't the line enable-ito prints: http://<wall>:43761 <key>" }
+        link.send(["t": "wall", "url": w.url, "key": w.key])
+        return nil
+    }
+
+    func clearWall() {
+        link.send(["t": "wall", "url": NSNull()])
+    }
+
+    /// What has been read here by someone actually at this Mac, to send again after a reconnect.
+    private var wallSeen: [String: Int64] = [:]
+
+    /// Read here: the phone takes those conversations' cards off the wall.
+    private func tellWallSeen(_ marks: [String: Int64]) {
+        guard phone.wallCapable, !marks.isEmpty else { return }
+        link.send(["t": "seen", "marks": marks])
+    }
+
+    /// Input in the last minute. A conversation left open on a Mac nobody is sitting at
+    /// counts as read here (no banner), but it has not been read, and the wall is for exactly
+    /// that: its card stays up until someone is back, or its two hours are over.
+    private var someoneHere: Bool {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!) < 60
     }
 
     // MARK: sending

@@ -31,6 +31,7 @@ import app.ito.link.PhoneHost
 import app.ito.link.PhoneLink
 import app.ito.link.Role
 import app.ito.link.SendTag
+import app.ito.link.WallConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -52,6 +53,7 @@ class Bridge(val ctx: Context) : PhoneHost {
     val store = Store(ctx.contentResolver, groups, ctx.packageName)
     val calls = Calls(this)
     val link = PhoneLink(this, log = { Log.w("ito-link", it) })
+    val wall = WallReporter(this)
 
     @Volatile var service: BridgeService? = null
 
@@ -66,6 +68,7 @@ class Bridge(val ctx: Context) : PhoneHost {
         private set
     val listeners = CopyOnWriteArraySet<() -> Unit>()
     private fun changed() = listeners.forEach { it() }
+    fun wallChanged() = changed()
 
     private val worker = HandlerThread("ito-watch").apply { start() }
     private val handler = Handler(worker.looper)
@@ -98,6 +101,10 @@ class Bridge(val ctx: Context) : PhoneHost {
         watch(Telephony.Mms.CONTENT_URI, 800) { pushMms() }
         watch(CallLog.Calls.CONTENT_URI, 800) { pushCalls() }
         watch(ContactsContract.Contacts.CONTENT_URI, 10_000) { pushContacts() }
+        // The wall hears about texts whether or not a Mac is linked; it waits out bursts itself.
+        observe(Telephony.Sms.CONTENT_URI) { wall.changed() }
+        observe(Telephony.Mms.CONTENT_URI) { wall.changed() }
+        wall.start()
         calls.startLegacy()
         watchIms()
         handler.postDelayed(object : Runnable {
@@ -145,6 +152,8 @@ class Bridge(val ctx: Context) : PhoneHost {
             null -> "needs-system-install"
         })
         .put("sms", hasSmsPermissions())
+        // Present (null when unset) means this phone can tell a wall, and takes "wall" and "seen".
+        .put("wall", wall.describe())
 
     override fun status(): JSONObject {
         val bm = ctx.getSystemService(BatteryManager::class.java)
@@ -211,6 +220,12 @@ class Bridge(val ctx: Context) : PhoneHost {
                 session.post(JSONObject().put("t", "photo").put("k", k).put("jpeg", store.photo(k) ?: JSONObject.NULL))
             }
             "mmspart" -> sendPart(session, msg.getLong("pid"))
+            "wall" -> wall.configure(
+                if (msg.isNull("url")) null
+                else WallConfig.of(msg.getString("url"), msg.optString("key"))
+                    ?: throw IllegalArgumentException("that is not a wall: paste the line enable-ito printed")
+            )
+            "seen" -> wall.seen(msg.getJSONObject("marks"))
             "dial", "answer", "decline", "hangup", "dtmf", "hold", "audio" -> calls.handle(session, msg)
             else -> throw IllegalArgumentException("unknown request $t")
         }
@@ -247,6 +262,8 @@ class Bridge(val ctx: Context) : PhoneHost {
 
     fun onInbound(from: String, body: String, sentAt: Long) {
         groups.onInbound(from, body, sentAt)
+        // Before the messaging app has stored it: holds the phone awake until the wall has heard.
+        wall.changed()
         // The messaging app stores the row on its own schedule; push again once it has.
         handler.postDelayed({ pushSms() }, 1500)
     }
@@ -327,6 +344,12 @@ class Bridge(val ctx: Context) : PhoneHost {
             })
         }.onFailure { Log.w(TAG, "cannot watch $uri (permission?)", it) }
     }
+
+    private fun observe(uri: android.net.Uri, onChange: () -> Unit) = runCatching {
+        ctx.contentResolver.registerContentObserver(uri, true, object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean) = onChange()
+        })
+    }.onFailure { Log.w(TAG, "cannot watch $uri (permission?)", it) }
 
     private fun advertise() {
         val nsd = ctx.getSystemService(NsdManager::class.java)

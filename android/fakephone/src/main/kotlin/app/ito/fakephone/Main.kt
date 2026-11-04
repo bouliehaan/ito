@@ -8,6 +8,10 @@ import app.ito.link.PhoneHost
 import app.ito.link.PhoneLink
 import app.ito.link.Role
 import app.ito.link.SendTag
+import app.ito.link.Wall
+import app.ito.link.WallConfig
+import app.ito.link.WallState
+import app.ito.link.WallText
 import app.ito.link.hex
 import app.ito.link.sha256
 import app.ito.link.toHex
@@ -15,6 +19,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.math.PI
@@ -28,7 +33,10 @@ import kotlin.math.sin
  *
  * --auto confirms pairing on the "phone" side by itself (it still prints the code).
  * --dir <path> keeps its key and pairings somewhere other than ~/.ito-fakephone; --no-mdns skips advertising.
- * Commands on stdin:  in <number> <text> | ring <number> | hangup | status
+ * Commands on stdin:  in <number> <text> | ring <number> | hangup | status | wall <url> <key> | wall off
+ *
+ * A wall (secondbrain) set from the Mac's settings, or with `wall`, hears about texts the way
+ * it would from the real phone: `in` puts one up, answering or reading it on the Mac takes it down.
  */
 
 private val people = listOf(
@@ -39,7 +47,7 @@ private val people = listOf(
     "Dentist" to "+15550100005",
 )
 
-private class FakePhone(dir: File, private val auto: Boolean) : PhoneHost {
+private class FakePhone(private val dir: File, private val auto: Boolean) : PhoneHost {
     private val keyFile = File(dir, "static.key")
     private val peersFile = File(dir, "peers.txt")
     override val staticKey: DhKey = if (keyFile.exists()) DhKey.fromPrivate(hex(keyFile.readText().trim()))
@@ -70,11 +78,11 @@ private class FakePhone(dir: File, private val auto: Boolean) : PhoneHost {
         calls += JSONObject().put("id", 2).put("n", people[1].second).put("nm", people[1].first).put("ty", 1).put("d", now - 7_200_000).put("dur", 312)
     }
 
-    @Synchronized fun addSms(address: String, body: String, type: Int, at: Long = System.currentTimeMillis(), tag: SendTag? = null): JSONObject {
+    @Synchronized fun addSms(address: String, body: String, type: Int, at: Long = System.currentTimeMillis(), tag: SendTag? = null, unread: Boolean = false): JSONObject {
         val id = nextSms.getAndIncrement()
         val thread = people.indexOfFirst { Numbers.same(it.second, address) }.toLong() + 1
         val row = JSONObject().put("id", id).put("th", if (thread > 0) thread else 99).put("a", address).put("b", body)
-            .put("d", at).put("ds", at).put("ty", type).put("r", 1).put("st", if (type == 2) 0 else -1)
+            .put("d", at).put("ds", at).put("ty", type).put("r", if (unread) 0 else 1).put("st", if (type == 2) 0 else -1)
         if (tag != null) groups.bindSent(tag, id)
         sms += row
         return row
@@ -94,13 +102,52 @@ private class FakePhone(dir: File, private val auto: Boolean) : PhoneHost {
         println("  -> sms to $to: ${body.replace("\n", " / ")}")
         link.broadcastRows("sms", listOf(enrich(row)))
         if (tag.cid != null) link.broadcast(JSONObject().put("t", "sent").put("cid", tag.cid).put("to", to).put("ok", true))
+        tellWall()
     }
 
     fun inbound(from: String, body: String) {
         val now = System.currentTimeMillis()
         groups.onInbound(from, body, now)
-        val row = addSms(from, body, 1, now)
+        val row = addSms(from, body, 1, now, unread = true)
         link.broadcastRows("sms", listOf(enrich(row)))
+        tellWall()
+    }
+
+    // --- the wall, as the real phone tells it (app/WallReporter.kt) ------------
+
+    private val wallFile = File(dir, "wall.json")
+    @Volatile private var wall: WallConfig? = runCatching { WallConfig.fromJson(JSONObject(wallFile.readText())) }.getOrNull()
+    @Volatile private var wallState: WallState? = null
+    private val seen = HashMap<String, Long>()
+    private val wallThread = Executors.newSingleThreadExecutor { r -> Thread(r, "wall").apply { isDaemon = true } }
+
+    fun setWall(c: WallConfig?) {
+        wall = c
+        wallState = null
+        if (c == null) wallFile.delete() else wallFile.writeText(c.toJson().toString())
+        println(if (c == null) "wall: off" else "wall: ${c.url}")
+        announceWall()
+        tellWall()
+    }
+
+    private fun describeWall(): Any = wall?.let { c ->
+        JSONObject().put("url", c.url).also { o -> wallState?.let { o.put("state", it.toJson()) } }
+    } ?: JSONObject.NULL
+
+    private fun announceWall() = link.broadcast(JSONObject().put("t", "wall").put("wall", describeWall()))
+
+    fun tellWall() = wallThread.execute {
+        val c = wall ?: return@execute
+        val now = System.currentTimeMillis()
+        val texts = rows { now - it.getLong("d") <= Wall.LOOKBACK_MS && !it.optBoolean("rl") }.map { r ->
+            val g = r.optString("g").takeIf { it.isNotEmpty() && groups.get(it) != null }
+            WallText(g?.let { "g:$it" } ?: "t:${r.getLong("th")}", r.getString("a"), r.getInt("ty") == 1, r.getInt("r") == 1, r.getLong("d"))
+        }
+        val report = synchronized(seen) { Wall.report(texts, seen, now, { n -> people.firstOrNull { Numbers.same(it.second, n) }?.first }, { groups.get(it)?.name }) }
+        val result = Wall.post(c, report, now)
+        wallState = result
+        println("  -> wall: " + if (result.ok) "${result.cards} card(s) up" else result.error)
+        announceWall()
     }
 
     // --- PhoneHost -----------------------------------------------------------
@@ -117,6 +164,7 @@ private class FakePhone(dir: File, private val auto: Boolean) : PhoneHost {
     override fun onSessionsChanged(count: Int) = println("linked macs: $count")
     override fun hello() = JSONObject().put("name", "fake phone").put("model", "JVM").put("android", "16").put("number", "+15550109999")
         .put("fp", sha256(staticKey.pub).toHex().take(8)).put("system", true).put("callAudio", "ok").put("sms", true)
+        .put("wall", describeWall())
     override fun status() = JSONObject().put("batt", 87).put("charging", true).put("plugged", true).put("temp", 29.5).put("wifi", true).put("ims", "wifi")
     override fun smsAfter(id: Long, limit: Int) = rows { it.getLong("id") > id }.take(limit)
     override fun smsRecent(count: Int) = rows { true }.takeLast(count)
@@ -163,6 +211,13 @@ private class FakePhone(dir: File, private val auto: Boolean) : PhoneHost {
             "hold" -> { callState = if (msg.optBoolean("on")) "held" else "active"; pushCall() }
             "dtmf" -> println("  dtmf ${msg.optString("d")}")
             "audio" -> { audioTo = if (msg.optBoolean("on")) session else null; pushCall() }
+            "wall" -> setWall(if (msg.isNull("url")) null else WallConfig.of(msg.getString("url"), msg.optString("key"))
+                ?: throw IllegalArgumentException("that is not a wall: paste the line enable-ito printed"))
+            "seen" -> {
+                val marks = msg.getJSONObject("marks")
+                synchronized(seen) { for (k in marks.keys()) seen[k] = maxOf(seen[k] ?: 0, marks.optLong(k)) }
+                tellWall()
+            }
         }
     }
 
@@ -253,8 +308,13 @@ fun main(args: Array<String>) {
             "hangup" -> phone.endCall()
             "ok" -> link.confirmPairing(true)
             "status" -> println("macs: ${link.trustedCount}, sms rows: ${phone.sms.size}")
+            "wall" -> when {
+                parts.getOrNull(1) == "off" -> phone.setWall(null)
+                parts.size == 3 -> WallConfig.of(parts[1], parts[2])?.let(phone::setWall) ?: println("wall <url> <key>, as enable-ito prints it")
+                else -> println("wall <url> <key>, as enable-ito prints it | wall off")
+            }
             "" -> Unit
-            else -> println("commands: in <number> <text> | ring <number> | hangup | ok | status")
+            else -> println("commands: in <number> <text> | ring <number> | hangup | ok | status | wall <url> <key> | wall off")
         }
     }
 }

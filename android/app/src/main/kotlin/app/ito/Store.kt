@@ -40,6 +40,11 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
 
     fun smsIds(): LongArray = ids(Telephony.Sms.CONTENT_URI)
 
+    /** Everything since [sinceMs], for the wall (WallReporter). Bodies are read, never sent there. */
+    fun smsSince(sinceMs: Long): List<JSONObject> =
+        query(Telephony.Sms.CONTENT_URI, smsCols, "${Telephony.Sms.DATE} > ?", arrayOf(sinceMs.toString()),
+            "${Telephony.Sms.DATE} ASC", row = ::smsRow)
+
     /** Sent rows Android wrote for ito that no tag has claimed yet (see Bridge.claimUnbound). */
     fun ourRecentSent(sinceMs: Long): List<JSONObject> =
         query(Telephony.Sms.CONTENT_URI, smsCols,
@@ -77,6 +82,19 @@ class Store(private val cr: ContentResolver, private val groups: GroupEngine, pr
         query(Telephony.Mms.CONTENT_URI, MMS_COLS, null, null, "${Telephony.Mms._ID} DESC", count, ::mmsRow).reversed()
 
     fun mmsIds(): LongArray = ids(Telephony.Mms.CONTENT_URI)
+
+    /** For the wall: who and when, without the parts. {th, d, box, r, from} */
+    fun mmsSince(sinceMs: Long): List<JSONObject> =
+        query(Telephony.Mms.CONTENT_URI, MMS_COLS, "${Telephony.Mms.DATE} > ?", arrayOf((sinceMs / 1000).toString()),
+            "${Telephony.Mms.DATE} ASC") { c ->
+            val id = c.getLong(0)
+            var from = ""
+            query(Uri.parse("content://mms/$id/addr"), arrayOf("address", "type"), "type = 137", null, null) { a ->
+                a.getString(0)?.takeIf { it.isNotEmpty() && it != "insert-address-token" }?.let { from = it }
+            }
+            JSONObject().put("th", c.getLong(1)).put("d", c.getLong(2) * 1000).put("box", c.getInt(3))
+                .put("r", c.getInt(5)).put("from", from)
+        }
 
     private fun mmsRow(c: Cursor): JSONObject {
         val id = c.getLong(0)
